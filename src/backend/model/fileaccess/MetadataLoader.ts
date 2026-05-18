@@ -13,10 +13,12 @@ import * as sharp from 'sharp';
 import {FfprobeData} from 'fluent-ffmpeg';
 import * as util from 'node:util';
 import * as path from 'path';
-import {Utils} from '../../../common/Utils';
+import {Utils, LRU} from '../../../common/Utils';
 import {FFmpegFactory} from '../FFmpegFactory';
 import {ExtensionDecorator} from '../extension/ExtensionDecorator';
 import {DateTags} from './MetadataCreationDate';
+import {GeocodeProviderRegistry, GeocodeResult} from '../database/OfflineGeocodeProvider';
+import {OFFLINE_CITIES1000_PROVIDER} from '../../../common/config/private/PrivateConfig';
 
 const {imageSizeFromFile} = require('image-size/fromFile');
 const LOG_TAG = '[MetadataLoader]';
@@ -163,7 +165,7 @@ export class MetadataLoader {
             const sidecarData: any = await exifr.sidecar(sidecarPath);
             if (sidecarData !== undefined) {
               // sidecar should not change the video dimension
-              MetadataLoader.mapMetadata(metadata, sidecarData, false);
+              MetadataLoader.mapMetadata(metadata, sidecarData, false, fullPath);
             }
           }
         }
@@ -228,7 +230,7 @@ export class MetadataLoader {
       try {
         try {
           const exif = await exifr.parse(fullPath, exifrOptions);
-          MetadataLoader.mapMetadata(metadata, exif, true);
+          MetadataLoader.mapMetadata(metadata, exif, true, fullPath);
           if (exif?.makerNote) {
             const contentId = MetadataLoader.parseAppleMakerNoteContentId(exif.makerNote);
             if (contentId) {
@@ -238,7 +240,7 @@ export class MetadataLoader {
         } catch (err) {
           try {
             const m = await sharp(fullPath, {failOnError: false}).metadata();
-            MetadataLoader.mapMetadata(metadata, this.mapExifReader(exifReader(m.exif)), true);
+            MetadataLoader.mapMetadata(metadata, this.mapExifReader(exifReader(m.exif)), true, fullPath);
           } catch (e) {
             // ignoring errors
           }
@@ -260,7 +262,7 @@ export class MetadataLoader {
               if (sidecarData !== undefined) {
                 //note that since side cars are loaded last, data loaded here overwrites embedded metadata (in Pigallery2, not in the actual files)
                 // sidecar should not change the image dimension
-                MetadataLoader.mapMetadata(metadata, sidecarData, false);
+                MetadataLoader.mapMetadata(metadata, sidecarData, false, fullPath);
                 break;
               }
             }
@@ -286,7 +288,7 @@ export class MetadataLoader {
     return metadata;
   }
 
-  private static mapMetadata(metadata: PhotoMetadata | VideoMetadata, exif: any, mapDimension = true) {
+  private static mapMetadata(metadata: PhotoMetadata | VideoMetadata, exif: any, mapDimension = true, fullPath?: string) {
     //replace adobe xap-section with xmp to reuse parsing
     if (Object.hasOwn(exif, 'xap')) {
       exif['xmp'] = exif['xap'];
@@ -302,7 +304,7 @@ export class MetadataLoader {
     MetadataLoader.mapTimestampAndOffset(metadata, exif);
     MetadataLoader.mapCameraData(metadata, exif);
     MetadataLoader.mapGPS(metadata, exif);
-    MetadataLoader.mapToponyms(metadata, exif);
+    MetadataLoader.mapToponyms(metadata, exif, fullPath);
     MetadataLoader.mapRating(metadata, exif);
     if (Config.Faces.enabled) {
       MetadataLoader.mapFaces(metadata, exif, orientation);
@@ -441,6 +443,15 @@ export class MetadataLoader {
       return [ts, offset];
     }
 
+    //Pads hours and minutes with leading zeroes if needed
+    function normalizeOffset(o: string | undefined): string | undefined {
+      // Undefined when neither the timestamp nor any helper tag carried an
+      // offset (common in video XMP sidecars). Returning undefined lets the
+      // outer mapMetadata pipeline keep running for downstream mappers (GPS,
+      // toponyms, etc.) instead of throwing on `undefined.replace`.
+      return o == null ? o : o.replace(/^([+-]?)(\d):/, "$10$2:");
+    }
+
 
   }
 
@@ -506,18 +517,155 @@ export class MetadataLoader {
     }
   }
 
-  private static mapToponyms(metadata: PhotoMetadata, exif: any) {
-    //Function to convert html code for special characters into their corresponding character (used in exif.photoshop-section)
-
+  private static mapToponyms(metadata: PhotoMetadata, exif: any, fullPath?: string) {
     metadata.positionData = metadata.positionData || {};
+    // IPTC IIM + XMP-photoshop (existing source layers).
     metadata.positionData.country = Utils.asciiToUTF8(exif.iptc?.Country) || Utils.decodeHTMLChars(exif.photoshop?.Country);
     metadata.positionData.state = Utils.asciiToUTF8(exif.iptc?.State) || Utils.decodeHTMLChars(exif.photoshop?.State);
     metadata.positionData.city = Utils.asciiToUTF8(exif.iptc?.City) || Utils.decodeHTMLChars(exif.photoshop?.City);
-    if (metadata.positionData) {
-      Utils.removeNullOrEmptyObj(metadata.positionData);
-      if (Object.keys(metadata.positionData).length === 0) {
-        delete metadata.positionData;
+
+    // XMP IPTC Extension (Iptc4xmpExt) — standards-compliant fallback, always on.
+    if (!metadata.positionData.country) {
+      metadata.positionData.country = MetadataLoader.xmpStringValue(exif.Iptc4xmpExt?.CountryName);
+    }
+    if (!metadata.positionData.state) {
+      metadata.positionData.state = MetadataLoader.xmpStringValue(exif.Iptc4xmpExt?.ProvinceState);
+    }
+    if (!metadata.positionData.city) {
+      metadata.positionData.city = MetadataLoader.xmpStringValue(exif.Iptc4xmpExt?.City);
+    }
+
+    // digiKam hierarchical Places/... tags — opt-in.
+    if (Config.Indexing.PhotoLocation?.DigikamPlacesTagEnabled) {
+      MetadataLoader.applyDigikamPlacesTag(metadata, exif, fullPath);
+    }
+
+    // F2: offline reverse-geocode GPS → country/state/city when text is still empty.
+    if (Config.Indexing.PhotoLocation?.ReverseGeocodeEnabled
+      && metadata.positionData?.GPSData?.latitude != null
+      && metadata.positionData?.GPSData?.longitude != null
+      && (!metadata.positionData.country
+        || !metadata.positionData.state
+        || !metadata.positionData.city)) {
+      MetadataLoader.applyReverseGeocode(metadata, fullPath);
+    }
+
+    Utils.removeNullOrEmptyObj(metadata.positionData);
+    if (Object.keys(metadata.positionData).length === 0) {
+      delete metadata.positionData;
+    }
+  }
+
+  private static reverseGeocodeCache = new LRU<GeocodeResult | null>(500);
+
+  private static applyReverseGeocode(metadata: PhotoMetadata, fullPath?: string) {
+    const lat = metadata.positionData.GPSData.latitude;
+    const lon = metadata.positionData.GPSData.longitude;
+    // Round to ~1 km cell — neighbouring photos share the same cache entry.
+    const cacheKey = `${lat.toFixed(2)},${lon.toFixed(2)}`;
+    let hit = MetadataLoader.reverseGeocodeCache.get(cacheKey);
+    if (hit === undefined) {
+      const provider = GeocodeProviderRegistry.get(OFFLINE_CITIES1000_PROVIDER);
+      hit = (provider && provider.reverse(lat, lon, fullPath)) || null;
+      MetadataLoader.reverseGeocodeCache.set(cacheKey, hit);
+    }
+    if (!hit) return;
+    if (!metadata.positionData.country && hit.country) {
+      metadata.positionData.country = hit.country;
+    }
+    if (!metadata.positionData.state && hit.state) {
+      metadata.positionData.state = hit.state;
+    }
+    if (!metadata.positionData.city && hit.city) {
+      metadata.positionData.city = hit.city;
+    }
+  }
+
+  private static xmpStringValue(v: any): string | undefined {
+    if (v == null) return undefined;
+    if (typeof v === 'string') return Utils.decodeHTMLChars(v) || undefined;
+    if (typeof v === 'object' && v.value !== undefined) {
+      return Utils.decodeHTMLChars(String(v.value)) || undefined;
+    }
+    return Utils.decodeHTMLChars(String(v)) || undefined;
+  }
+
+  // F1: read digiKam `Places/...` paths from hierarchical XMP namespaces, pick
+  // the longest path, and fill empty country/state/city per the depth-aware
+  // mapping (see feat-location-search/README.md §4.1).
+  private static applyDigikamPlacesTag(metadata: PhotoMetadata, exif: any, fullPath?: string) {
+    if (metadata.positionData.country
+      && metadata.positionData.state
+      && metadata.positionData.city) {
+      return;
+    }
+    const paths: string[][] = [];
+    const collect = (raw: any, sep: string) => {
+      if (!raw) return;
+      const arr = Array.isArray(raw) ? raw : [raw];
+      for (const entry of arr) {
+        if (typeof entry !== 'string') continue;
+        const segs = entry.split(sep).filter(s => s.length > 0);
+        if (segs.length < 2 || segs[0] !== 'Places') continue;
+        paths.push(segs.slice(1));
       }
+    };
+    collect(exif.digiKam?.TagsList, '/');
+    if (paths.length === 0) {
+      collect(exif.lr?.HierarchicalSubject, '|');
+    }
+    if (paths.length === 0) return;
+    let longest = paths[0];
+    for (const p of paths) {
+      if (p.length > longest.length) longest = p;
+    }
+    // Depth-aware mapping per §3.2.4:
+    //   1 → country
+    //   2 → country + (state OR city — disambiguated per below)
+    //   3 → country + state + city
+    //   ≥4 → country + state + city (segments 3+ dropped)
+    //
+    // For depth-2 (`Places/X/Y`), digiKam's own metadata-mode behaviour writes
+    // Y as the city. But user libraries also legitimately use depth-2 as
+    // country+state (e.g. `Places/United States/Illinois`). When the offline
+    // cities database is available, ask it whether Y is a known admin1 (state)
+    // of country X — if yes, slot Y into state; otherwise fall back to city.
+    const country = longest[0];
+    let state: string | undefined;
+    let city: string | undefined;
+    if (longest.length === 2) {
+      const second = longest[1];
+      const provider = GeocodeProviderRegistry.get(OFFLINE_CITIES1000_PROVIDER);
+      let looksLikeState = false;
+      try {
+        looksLikeState = !!provider?.isAdmin1?.(country, second);
+      } catch (e) {
+        // Defensive: a malformed/corrupted geocoder DB throws here; we'd
+        // rather degrade to the original city-slot behaviour than fail the
+        // whole metadata load.
+        Logger.debug('[DigikamPlaceImport]',
+          `${fullPath ?? '<unknown>'} — isAdmin1 threw for ('${country}','${second}'): ${e}`);
+      }
+      if (looksLikeState) {
+        state = second;
+      } else {
+        city = second;
+        Logger.debug('[DigikamPlaceImport]',
+          `${fullPath ?? '<unknown>'} — depth-2 tag 'Places/${country}/${second}': `
+          + `'${second}' is not a known admin1 of ${country}; storing as city`);
+      }
+    } else if (longest.length >= 3) {
+      state = longest[1];
+      city = longest[2];
+    }
+    if (!metadata.positionData.country) {
+      metadata.positionData.country = country;
+    }
+    if (!metadata.positionData.state && state) {
+      metadata.positionData.state = state;
+    }
+    if (!metadata.positionData.city && city) {
+      metadata.positionData.city = city;
     }
   }
 

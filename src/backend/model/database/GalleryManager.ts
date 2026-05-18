@@ -119,7 +119,16 @@ export class GalleryManager {
       const dir = await this.getDirIdAndTime(connection, directoryPath.name, directoryPath.parent);
       return await this.getParentDirFromId(connection, session, dir.id);
     }
-    return ObjectManagers.getInstance().IndexingManager.indexDirectory(relativeDirectoryName);
+    // Wait for save so the response carries everything saveToDB derives —
+    // notably the synthesised GPS that F3 writes after the photos are
+    // persisted. Without `true` the dirClone returned here predates the save,
+    // and the map widget appears empty on the first visit of a never-indexed
+    // folder. IndexingManager.indexDirectory now mirrors the freshly-saved
+    // positionData back into dirClone before returning.
+    return ObjectManagers.getInstance().IndexingManager.indexDirectory(
+      relativeDirectoryName,
+      true
+    );
   }
 
   async countDirectories(): Promise<number> {

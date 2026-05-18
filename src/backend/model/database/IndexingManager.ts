@@ -24,6 +24,9 @@ import {MDFileEntity} from './enitites/MDFileEntity';
 import {MDFileDTO} from '../../../common/entities/MDFileDTO';
 import {DiskManager} from '../fileaccess/DiskManager';
 import {ProjectedDirectoryCacheEntity} from './enitites/ProjectedDirectoryCacheEntity';
+import {Config} from '../../../common/config/private/Config';
+import {GeocodeProviderRegistry} from './OfflineGeocodeProvider';
+import {OFFLINE_CITIES1000_PROVIDER} from '../../../common/config/private/PrivateConfig';
 
 const LOG_TAG = '[IndexingManager]';
 
@@ -100,6 +103,20 @@ export class IndexingManager {
       if (waitForSave === true) {
         // save directory to DB and wait until saving finishes
         await this.queueForSave(scannedDirectory);
+        // F3 (synthesizeGPS) ran inside saveToDB and patched
+        // scannedDirectory.media in place. The response we return is a deep
+        // clone captured *before* the save, so mirror the freshly-synthesised
+        // positionData across by name. Without this, the first browse of a
+        // folder gets a text-only response and the map widget shows up empty
+        // until the next refresh hits the DB cache.
+        const src = new Map(scannedDirectory.media.map(m => [m.name, m]));
+        for (const m of dirClone.media) {
+          const fresh = src.get(m.name);
+          if (fresh && (fresh as PhotoEntity).metadata) {
+            (m as PhotoEntity).metadata.positionData =
+              (fresh as PhotoEntity).metadata.positionData;
+          }
+        }
         return dirClone;
       }
 
@@ -144,6 +161,19 @@ export class IndexingManager {
       await this.saveMedia(connection, currentDirId, scannedDirectory.media);
       await this.saveMetaFiles(connection, currentDirId, scannedDirectory);
       await IndexingManager.processServerSidePG2Conf(scannedDirectory, serverSideConfigs);
+      // F3: incremental synthesis for the photos just persisted in this dir.
+      // Centroid index is rebuilt over the whole library each time, so a new
+      // dir's missing-GPS photos benefit from sibling-dir GPS samples without
+      // waiting for the full Indexing job to complete. Pass the in-memory
+      // media array so synthesized coords also land on the response object
+      // that indexDirectory returns on the same request — otherwise the first
+      // browse of a folder gets text-only rows and the map widget stays
+      // empty until the next refresh.
+      try {
+        await this.synthesizeGPS(currentDirId, scannedDirectory.media);
+      } catch (e) {
+        Logger.error(LOG_TAG, 'synthesizeGPS failed for dir ' + currentDirId + ': ' + e);
+      }
       await ObjectManagers.getInstance().onDataChange(scannedDirectory);
     } finally {
       this.isSaving = false;
@@ -534,6 +564,198 @@ export class IndexingManager {
     await personJunctionTable.remove(indexedFaces, {
       chunk: Math.max(Math.ceil(indexedFaces.length / 500), 1),
     });
+  }
+
+  // F3: post-indexing pass that writes synthesized GPS into photos that have a
+  // text location but no real GPS. The centroid index is built per call from the
+  // current DB state — see feat-location-search/README.md §4.3.
+  //
+  // Pass `parentDirId` to limit the target scan to one directory's photos
+  // (used by the per-folder lazy reindex path). The centroid index itself is
+  // always built over the full library so a single dir's missing-GPS photos
+  // still benefit from sibling-dir GPS samples.
+  //
+  // `patchMedia` is an in-memory media list (the same one being persisted) —
+  // when provided, each synthesised row is mirrored back into the matching
+  // media object's `metadata.positionData.GPSData`. Needed because the
+  // response object returned by `indexDirectory` is a clone captured *before*
+  // saveToDB runs: without this mirror, the first browse of a folder gets a
+  // text-only response and the map widget stays empty until the next refresh.
+  public async synthesizeGPS(
+    parentDirId?: number,
+    patchMedia?: MediaDTO[]
+  ): Promise<{ updated: number; scanned: number }> {
+    if (!Config.Indexing.PhotoLocation?.SyntheticGPSEnabled) {
+      return {updated: 0, scanned: 0};
+    }
+    Logger.info(LOG_TAG, parentDirId
+      ? `Synthesizing GPS scoped to dir id ${parentDirId}`
+      : 'Synthesizing GPS for photos with text location but no GPS');
+    const connection = await SQLConnection.getConnection();
+    const mediaTable = connection.getRepository(MediaEntity).metadata.tableName;
+    type CentroidRow = {
+      country: string | null;
+      state: string | null;
+      city: string | null;
+      lat: number;
+      lon: number;
+      n: number;
+    };
+    // Raw SQL: TypeORM property-path translation requires going through entity
+    // aliases, which doesn't apply to the column names actually written to
+    // SQLite. Use the flat column names directly.
+    const CC = 'metadataPositionDataCountry';
+    const SC = 'metadataPositionDataState';
+    const CTY = 'metadataPositionDataCity';
+    const LAT = 'metadataPositionDataGPSDataLatitude';
+    const LON = 'metadataPositionDataGPSDataLongitude';
+    const centroidRows: CentroidRow[] = await connection
+      .createQueryBuilder()
+      .select(CC, 'country')
+      .addSelect(SC, 'state')
+      .addSelect(CTY, 'city')
+      .addSelect(`AVG(${LAT})`, 'lat')
+      .addSelect(`AVG(${LON})`, 'lon')
+      .addSelect(`COUNT(*)`, 'n')
+      .from(mediaTable, 'media')
+      .where(`${LAT} IS NOT NULL`)
+      .andWhere(`${LON} IS NOT NULL`)
+      .andWhere(`${CC} IS NOT NULL`)
+      .groupBy(CC)
+      .addGroupBy(SC)
+      .addGroupBy(CTY)
+      .getRawMany();
+
+    const cityIdx = new Map<string, CentroidRow>();
+    const stateIdx = new Map<string, CentroidRow>();
+    const countryIdx = new Map<string, CentroidRow>();
+    const norm = (s: string | null | undefined) => (s == null ? '' : s.toLowerCase());
+    const aggregate = (
+      bucket: Map<string, CentroidRow>,
+      key: string,
+      row: CentroidRow
+    ) => {
+      const prev = bucket.get(key);
+      if (!prev) {
+        bucket.set(key, {...row});
+        return;
+      }
+      const total = prev.n + row.n;
+      prev.lat = (prev.lat * prev.n + row.lat * row.n) / total;
+      prev.lon = (prev.lon * prev.n + row.lon * row.n) / total;
+      prev.n = total;
+    };
+    for (const row of centroidRows) {
+      cityIdx.set(`${norm(row.country)}|${norm(row.state)}|${norm(row.city)}`, row);
+      aggregate(stateIdx, `${norm(row.country)}|${norm(row.state)}`, row);
+      aggregate(countryIdx, `${norm(row.country)}`, row);
+    }
+
+    const provider = GeocodeProviderRegistry.get(OFFLINE_CITIES1000_PROVIDER);
+
+    // Pull the directory path + name alongside media id so per-photo log lines
+    // can carry the absolute path on disk (operators want to grep their logs
+    // for "Foo/bar.jpg" without having to JOIN themselves).
+    const dirTable = connection.getRepository(DirectoryEntity).metadata.tableName;
+    const targetsQB = connection
+      .createQueryBuilder()
+      .select('media.id', 'id')
+      .addSelect('media.name', 'name')
+      .addSelect(`media.${CC}`, 'country')
+      .addSelect(`media.${SC}`, 'state')
+      .addSelect(`media.${CTY}`, 'city')
+      .addSelect('d.path', 'dirPath')
+      .addSelect('d.name', 'dirName')
+      .from(mediaTable, 'media')
+      .innerJoin(dirTable, 'd', 'd.id = media.directoryId')
+      .where(`media.${LAT} IS NULL`)
+      .andWhere(`media.${CC} IS NOT NULL`);
+    if (parentDirId != null) {
+      targetsQB.andWhere('media.directoryId = :dirId', {dirId: parentDirId});
+    }
+    const targets = await targetsQB.getRawMany();
+    const patchByName = patchMedia ? new Map(patchMedia.map(m => [m.name, m])) : null;
+    const fullPathOf = (t: { dirPath: string; dirName: string; name: string }) =>
+      path.join(ProjectPath.ImageFolder, t.dirPath || '', t.dirName || '', t.name);
+
+    let updated = 0;
+    const srcCount = {libCity: 0, libState: 0, geoTriple: 0, libCountry: 0, geoCountry: 0};
+    let skipped = 0;
+    // Build a single UPDATE per row via raw SQL — bypasses TypeORM property-path
+    // translation issues for embedded fields.
+    const updateStmt = `UPDATE "${mediaTable}" SET "${LAT}" = ?, "${LON}" = ? WHERE id = ?`;
+    const driver: any = connection.driver;
+    const rawUpdate = async (lat: number, lon: number, id: number) => {
+      await connection.query(updateStmt, [lat, lon, id]);
+    };
+
+    const askProvider = (q: { country?: string; state?: string; city?: string }, fullPath: string) => {
+      if (!provider) return null;
+      const r = provider.geocode(q, fullPath);
+      return (r && r.latitude != null && r.longitude != null)
+        ? {lat: r.latitude, lon: r.longitude}
+        : null;
+    };
+
+    for (const t of targets) {
+      const c = norm(t.country);
+      const s = norm(t.state);
+      const ci = norm(t.city);
+      const fullPath = fullPathOf(t);
+      // Layered lookup per README §4.3:
+      // 1. Library (country, state, city) — finest authoritative GPS samples.
+      // 2. Library (country, state, *) — state-level library centroid.
+      // 3. Provider with the full triple — finer-than-country geocode
+      //    (also covers F1's depth-2 misclassified-leaf case via the
+      //    state-fallback inside OfflineCitiesGeocodeProvider.geocode).
+      // 4. Library (country, *, *) — last library-derived guess.
+      // 5. Provider country-only — last resort.
+      let pick: { lat: number; lon: number } | null = null;
+      let pickSrc: keyof typeof srcCount | null = null;
+      if (ci && cityIdx.has(`${c}|${s}|${ci}`)) {
+        pick = cityIdx.get(`${c}|${s}|${ci}`);
+        pickSrc = 'libCity';
+      } else if (s && stateIdx.has(`${c}|${s}`)) {
+        pick = stateIdx.get(`${c}|${s}`);
+        pickSrc = 'libState';
+      }
+      if (!pick && (ci || s)) {
+        pick = askProvider({country: t.country, state: t.state, city: t.city}, fullPath);
+        if (pick) pickSrc = 'geoTriple';
+      }
+      if (!pick && c && countryIdx.has(c)) {
+        pick = countryIdx.get(c);
+        pickSrc = 'libCountry';
+      }
+      if (!pick) {
+        pick = askProvider({country: t.country}, fullPath);
+        if (pick) pickSrc = 'geoCountry';
+      }
+      if (!pick) {
+        Logger.warn('[SyntheticGPS]',
+          `${fullPath} — no centroid for ${t.country ?? '*'}/${t.state ?? '*'}/${t.city ?? '*'}; left without GPS`);
+        skipped++;
+        continue;
+      }
+      const lat6 = parseFloat(pick.lat.toFixed(6));
+      const lon6 = parseFloat(pick.lon.toFixed(6));
+      await rawUpdate(lat6, lon6, t.id);
+      const inMem = patchByName?.get(t.name);
+      if (inMem) {
+        const pm = (inMem as PhotoEntity).metadata as PhotoMetadata;
+        pm.positionData = pm.positionData || {};
+        pm.positionData.GPSData = {latitude: lat6, longitude: lon6};
+      }
+      if (pickSrc) srcCount[pickSrc]++;
+      updated++;
+    }
+    void driver; // kept for symmetry with other managers; not used here.
+    Logger.info('[SyntheticGPS]',
+      `dir=${parentDirId ?? '*'} scanned=${targets.length} updated=${updated}`
+      + ` src={lib-city: ${srcCount.libCity}, lib-state: ${srcCount.libState},`
+      + ` geo-triple: ${srcCount.geoTriple}, lib-country: ${srcCount.libCountry},`
+      + ` geo-country: ${srcCount.geoCountry}} skipped=${skipped}`);
+    return {updated, scanned: targets.length};
   }
 
   private checkSavingReady(): void {

@@ -29,4 +29,10 @@ export class LocationManager implements IObjectManager {
 
     return this.cache.get(text);
   }
+
+  // Called by GalleryResetJob (via IndexingManager.resetDB) so the next
+  // `km-from:` lookup re-resolves text → coords against the live geocoder.
+  clearCache(): void {
+    this.cache = new LRU<GPSMetadata>(100);
+  }
 }

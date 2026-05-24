@@ -23,6 +23,7 @@ import {PersonJunctionTable} from './enitites/person/PersonJunctionTable';
 import {MDFileEntity} from './enitites/MDFileEntity';
 import {MDFileDTO} from '../../../common/entities/MDFileDTO';
 import {DiskManager} from '../fileaccess/DiskManager';
+import {MetadataLoader} from '../fileaccess/MetadataLoader';
 import {ProjectedDirectoryCacheEntity} from './enitites/ProjectedDirectoryCacheEntity';
 import {Config} from '../../../common/config/private/Config';
 import {GeocodeProviderRegistry} from './OfflineGeocodeProvider';
@@ -72,12 +73,97 @@ export class IndexingManager {
   }
 
   /**
-   * Indexes a dir, but returns early with the scanned version,
-   * does not wait for the DB to be saved
+   * Indexes a dir.
+   *
+   *  - Default: returns early with the scanned version; save happens in the
+   *    background.
+   *  - `waitForSave = true`: blocks until saveToDB resolves (lazy reindex path).
+   *  - `saveDeadlineMs` (only meaningful when `waitForSave` is false):
+   *    races the *entire* scan+save chain against this deadline. If the chain
+   *    finishes inside the window we mirror its `positionData` mutations into
+   *    the response so F3's synthesised GPS is visible on the very first
+   *    request. If the deadline expires first, the scan/save keep running in
+   *    the background and we return a `syncing = true` stub so the frontend
+   *    can poll until the work completes and the DB has the content.
    */
   public async indexDirectory(
     relativeDirectoryName: string,
-    waitForSave = false
+    waitForSave = false,
+    saveDeadlineMs?: number
+  ): Promise<ParentDirectoryDTO> {
+    if (saveDeadlineMs != null && saveDeadlineMs > 0 && !waitForSave) {
+      return this.indexDirectoryWithDeadline(relativeDirectoryName, saveDeadlineMs);
+    }
+    return this.indexDirectoryCore(relativeDirectoryName, waitForSave);
+  }
+
+  // Tracks dir paths that are scanning/saving in the background after a
+  // previous request hit the deadline and returned a syncing stub. While a
+  // dir is in this set, subsequent polls short-circuit to another stub
+  // instead of starting a parallel scan.
+  private inflightBgIndex = new Set<string>();
+
+  public isBackgroundIndexing(relativeDirectoryName: string): boolean {
+    return this.inflightBgIndex.has(relativeDirectoryName);
+  }
+
+  private async indexDirectoryWithDeadline(
+    relativeDirectoryName: string,
+    deadlineMs: number
+  ): Promise<ParentDirectoryDTO> {
+    // Already running from a previous timed-out request? Return another stub
+    // immediately so the user keeps polling against the existing scan rather
+    // than kicking off a duplicate one.
+    if (this.inflightBgIndex.has(relativeDirectoryName)) {
+      return this.makeSyncingStub(relativeDirectoryName);
+    }
+    this.inflightBgIndex.add(relativeDirectoryName);
+    const work = this.indexDirectoryCore(relativeDirectoryName, true)
+      .finally(() => this.inflightBgIndex.delete(relativeDirectoryName));
+    type Outcome =
+      | { kind: 'done'; dir: ParentDirectoryDTO }
+      | { kind: 'err'; err: unknown }
+      | { kind: 'timeout' };
+    const outcome: Outcome = await Promise.race<Outcome>([
+      work.then(dir => ({kind: 'done', dir} as Outcome),
+        err => ({kind: 'err', err} as Outcome)),
+      new Promise<Outcome>(r =>
+        setTimeout(() => r({kind: 'timeout'}), deadlineMs)),
+    ]);
+    if (outcome.kind === 'done') return outcome.dir;
+    if (outcome.kind === 'err') throw outcome.err;
+    // Make sure the still-running work's rejection (if any) can't surface as
+    // an unhandled rejection after the response is sent.
+    work.catch(console.error);
+    return this.makeSyncingStub(relativeDirectoryName);
+  }
+
+  private makeSyncingStub(relativeDirectoryName: string): ParentDirectoryDTO {
+    const trimmed = relativeDirectoryName.replace(/[\\/]+$/, '');
+    const lastSep = Math.max(
+      trimmed.lastIndexOf('/'),
+      trimmed.lastIndexOf('\\')
+    );
+    const name = lastSep < 0 ? trimmed : trimmed.substring(lastSep + 1);
+    const dirPath = lastSep < 0 ? './' : trimmed.substring(0, lastSep) + '/';
+    return {
+      id: 0,
+      name,
+      path: dirPath,
+      lastModified: Date.now(),
+      isPartial: true,
+      syncing: true,
+      parent: null,
+      directories: [],
+      media: [],
+      metaFile: [],
+      cache: {mediaCount: 0},
+    } as unknown as ParentDirectoryDTO;
+  }
+
+  private async indexDirectoryCore(
+    relativeDirectoryName: string,
+    waitForSave: boolean
   ): Promise<ParentDirectoryDTO> {
     try {
       // Check if root is still a valid (non-empty) folder
@@ -100,15 +186,12 @@ export class IndexingManager {
 
       DirectoryDTOUtils.addReferences(dirClone);
 
-      if (waitForSave === true) {
-        // save directory to DB and wait until saving finishes
-        await this.queueForSave(scannedDirectory);
-        // F3 (synthesizeGPS) ran inside saveToDB and patched
-        // scannedDirectory.media in place. The response we return is a deep
-        // clone captured *before* the save, so mirror the freshly-synthesised
-        // positionData across by name. Without this, the first browse of a
-        // folder gets a text-only response and the map widget shows up empty
-        // until the next refresh hits the DB cache.
+      // Local helper that copies any positionData mutations (e.g. F3's
+      // synthesised GPS) from scannedDirectory.media back into dirClone.media
+      // by name. saveToDB mutates scannedDirectory in place, but dirClone is a
+      // deep clone captured before the save, so the response would otherwise
+      // miss the just-derived coords on the first call.
+      const mirrorSavedPositionData = () => {
         const src = new Map(scannedDirectory.media.map(m => [m.name, m]));
         for (const m of dirClone.media) {
           const fresh = src.get(m.name);
@@ -117,6 +200,11 @@ export class IndexingManager {
               (fresh as PhotoEntity).metadata.positionData;
           }
         }
+      };
+
+      if (waitForSave === true) {
+        await this.queueForSave(scannedDirectory);
+        mirrorSavedPositionData();
         return dirClone;
       }
 
@@ -141,6 +229,12 @@ export class IndexingManager {
       .createQueryBuilder('directory')
       .delete()
       .execute();
+    // Cascading delete on directory_entity already wipes the on-disk geo
+    // columns. The pieces below are in-process caches that survive a DB
+    // wipe and would otherwise hand stale answers back to the next pass.
+    MetadataLoader.clearCaches();
+    this.inflightBgIndex.clear();
+    ObjectManagers.getInstance().LocationManager?.clearCache();
   }
 
   public async saveToDB(scannedDirectory: ParentDirectoryDTO): Promise<void> {

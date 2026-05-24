@@ -558,6 +558,14 @@ export class MetadataLoader {
 
   private static reverseGeocodeCache = new LRU<GeocodeResult | null>(500);
 
+  // Called by GalleryResetJob (via IndexingManager.resetDB) so the next pass
+  // doesn't get yesterday's answers back from the in-process cache. The
+  // bundled cities1000 SQLite handle on the provider stays open — it's
+  // read-only reference data, nothing to clear.
+  public static clearCaches(): void {
+    MetadataLoader.reverseGeocodeCache = new LRU<GeocodeResult | null>(500);
+  }
+
   private static applyReverseGeocode(metadata: PhotoMetadata, fullPath?: string) {
     const lat = metadata.positionData.GPSData.latitude;
     const lon = metadata.positionData.GPSData.longitude;

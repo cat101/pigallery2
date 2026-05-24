@@ -119,15 +119,19 @@ export class GalleryManager {
       const dir = await this.getDirIdAndTime(connection, directoryPath.name, directoryPath.parent);
       return await this.getParentDirFromId(connection, session, dir.id);
     }
-    // Wait for save so the response carries everything saveToDB derives —
-    // notably the synthesised GPS that F3 writes after the photos are
-    // persisted. Without `true` the dirClone returned here predates the save,
-    // and the map widget appears empty on the first visit of a never-indexed
-    // folder. IndexingManager.indexDirectory now mirrors the freshly-saved
-    // positionData back into dirClone before returning.
+    // Race the whole scan+save chain against a deadline. Small folders finish
+    // in time and the response carries the full content (with F3's synthesised
+    // GPS) on the first call. Big folders blow the deadline and the response
+    // is a `syncing = true` stub; the scan/save keep running in the background
+    // and the frontend polls every few seconds until the dir's cached path
+    // here picks up the freshly-saved content and serves real photos +
+    // map pins, without the user pressing refresh.
+    //
+    // 25 s sits well under typical reverse-proxy timeouts (≥30 s) and
+    // accommodates most folders on healthy storage. Folders that take longer
+    // (hundreds of photos on slow NFS) get the stub-then-poll experience.
     return ObjectManagers.getInstance().IndexingManager.indexDirectory(
-      relativeDirectoryName,
-      true
+      relativeDirectoryName, false, 25000
     );
   }
 

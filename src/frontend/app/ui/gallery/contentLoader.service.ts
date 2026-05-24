@@ -22,6 +22,14 @@ export class ContentLoaderService implements OnDestroy {
   private lastContentRequest: { type: 'directory' | 'search', value: string } = null;
   private pollingTimerRestart = new Subject<void>();
   private pollingSub: Subscription;
+  // syncing-poll: when the backend returns `directory.syncing = true`, we
+  // re-fetch the same dir every SYNCING_POLL_MS until the flag clears or
+  // SYNCING_POLL_CAP_MS elapses. Keeps the leaflet/map auto-updating after
+  // background F3 finishes without forcing the user to refresh manually.
+  private syncingPollTimeout: ReturnType<typeof setTimeout> = null;
+  private syncingPollDeadlineAt = 0;
+  private readonly SYNCING_POLL_MS = 4000;
+  private readonly SYNCING_POLL_CAP_MS = 90_000;
 
   constructor(
     private networkService: NetworkService,
@@ -40,6 +48,40 @@ export class ContentLoaderService implements OnDestroy {
 
   ngOnDestroy(): void {
     this.unSubPolling();
+    this.cancelSyncingPoll();
+  }
+
+  private cancelSyncingPoll(): void {
+    if (this.syncingPollTimeout) {
+      clearTimeout(this.syncingPollTimeout);
+      this.syncingPollTimeout = null;
+    }
+    this.syncingPollDeadlineAt = 0;
+  }
+
+  private scheduleSyncingPollIfNeeded(cw: PackedContentWrapperWithError | null): void {
+    const syncing = (cw as any)?.directory?.syncing === true;
+    if (!syncing) {
+      this.cancelSyncingPoll();
+      return;
+    }
+    const now = Date.now();
+    if (this.syncingPollDeadlineAt === 0) {
+      this.syncingPollDeadlineAt = now + this.SYNCING_POLL_CAP_MS;
+    }
+    if (now >= this.syncingPollDeadlineAt) {
+      // Gave up — leave the banner showing (DTO still has syncing=true). A
+      // manual refresh will reset the cap.
+      return;
+    }
+    if (this.syncingPollTimeout) return;
+    this.syncingPollTimeout = setTimeout(() => {
+      this.syncingPollTimeout = null;
+      // Only re-fetch if we're still on the same directory.
+      if (this.lastContentRequest?.type === 'directory') {
+        this.loadDirectory(this.lastContentRequest.value, true).catch(console.error);
+      }
+    }, this.SYNCING_POLL_MS);
   }
 
   setupAutoUpdate() {
@@ -79,6 +121,12 @@ export class ContentLoaderService implements OnDestroy {
 
     // load from cache
     const cachedCw = this.galleryCacheService.getDirectory(directoryName);
+
+    // If this is a fresh navigation (different dir than the one we are polling
+    // for), drop any in-flight syncing-poll for the previous dir.
+    if (this.lastContentRequest?.value !== directoryName) {
+      this.cancelSyncingPoll();
+    }
 
     this.setContent(ContentWrapperUtils.unpack(cachedCw));
     this.ongoingContentRequest = directoryName;
@@ -129,7 +177,7 @@ export class ContentLoaderService implements OnDestroy {
       this.galleryCacheService.setDirectory(cw); // save it before adding references
     }
     this.setContent(ContentWrapperUtils.unpack(cw));
-
+    this.scheduleSyncingPollIfNeeded(cw);
   }
 
   public async search(query: SearchQueryDTO, forceReload = false): Promise<void> {

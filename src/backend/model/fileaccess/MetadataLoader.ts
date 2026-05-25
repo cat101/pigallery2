@@ -19,6 +19,7 @@ import {ExtensionDecorator} from '../extension/ExtensionDecorator';
 import {DateTags} from './MetadataCreationDate';
 import {GeocodeProviderRegistry, GeocodeResult} from '../database/OfflineGeocodeProvider';
 import {OFFLINE_CITIES1000_PROVIDER} from '../../../common/config/private/PrivateConfig';
+import {PlacesOverrides} from '../PlacesOverrides';
 
 const {imageSizeFromFile} = require('image-size/fromFile');
 const LOG_TAG = '[MetadataLoader]';
@@ -540,7 +541,8 @@ export class MetadataLoader {
       MetadataLoader.applyDigikamPlacesTag(metadata, exif, fullPath);
     }
 
-    // F2: offline reverse-geocode GPS → country/state/city when text is still empty.
+    // Offline reverse-geocode GPS → country/state/city when text is still
+    // empty (controlled by Indexing.PhotoLocation.ReverseGeocodeEnabled).
     if (Config.Indexing.PhotoLocation?.ReverseGeocodeEnabled
       && metadata.positionData?.GPSData?.latitude != null
       && metadata.positionData?.GPSData?.longitude != null
@@ -598,9 +600,10 @@ export class MetadataLoader {
     return Utils.decodeHTMLChars(String(v)) || undefined;
   }
 
-  // F1: read digiKam `Places/...` paths from hierarchical XMP namespaces, pick
+  // Read digiKam `Places/...` paths from hierarchical XMP namespaces, pick
   // the longest path, and fill empty country/state/city per the depth-aware
-  // mapping (see feat-location-search/README.md §4.1).
+  // mapping documented inline below. Also applies the manual-GPS override
+  // map (places_overrides.json) when one is loaded.
   private static applyDigikamPlacesTag(metadata: PhotoMetadata, exif: any, fullPath?: string) {
     if (metadata.positionData.country
       && metadata.positionData.state
@@ -623,38 +626,58 @@ export class MetadataLoader {
       collect(exif.lr?.HierarchicalSubject, '|');
     }
     if (paths.length === 0) return;
+    // Pick the longest path; tie-break by lexicographic order of the joined
+    // path so the same input always produces the same output (otherwise the
+    // first-tag-wins behaviour depends on the loader's iteration order).
     let longest = paths[0];
     for (const p of paths) {
-      if (p.length > longest.length) longest = p;
+      if (p.length > longest.length
+        || (p.length === longest.length && p.join('/') < longest.join('/'))) {
+        longest = p;
+      }
     }
-    // Depth-aware mapping per §3.2.4:
+    // Per-Places-path manual GPS pin from places_overrides.json. Looked up
+    // against the longest path (the same one the depth-aware mapping below
+    // uses for country/state/city). Soft override only — fills GPS when
+    // missing, never overwrites. The city slot is intentionally NOT
+    // rewritten, to keep position-search consistent across all photos
+    // sharing the same Places path.
+    const placesPath = 'Places/' + longest.join('/');
+    const override = PlacesOverrides.get().lookup(placesPath);
+    if (override) {
+      metadata.positionData.GPSData = metadata.positionData.GPSData || {};
+      const hadLat = metadata.positionData.GPSData.latitude != null;
+      const hadLon = metadata.positionData.GPSData.longitude != null;
+      if (!hadLat && !hadLon) {
+        metadata.positionData.GPSData.latitude = parseFloat(override.lat.toFixed(6));
+        metadata.positionData.GPSData.longitude = parseFloat(override.lon.toFixed(6));
+        Logger.debug('[PlacesOverrides]',
+          `${fullPath ?? '<unknown>'} — pinned to (${override.lat}, ${override.lon}) via ${placesPath}`);
+      } else {
+        Logger.debug('[PlacesOverrides]',
+          `${fullPath ?? '<unknown>'} — override for ${placesPath} skipped; photo already has GPS`);
+      }
+    }
+    // Depth-aware mapping:
     //   1 → country
-    //   2 → country + (state OR city — disambiguated per below)
+    //   2 → country + (state OR city — disambiguated below)
     //   3 → country + state + city
     //   ≥4 → country + state + city (segments 3+ dropped)
     //
-    // For depth-2 (`Places/X/Y`), digiKam's own metadata-mode behaviour writes
-    // Y as the city. But user libraries also legitimately use depth-2 as
-    // country+state (e.g. `Places/United States/Illinois`). When the offline
-    // cities database is available, ask it whether Y is a known admin1 (state)
-    // of country X — if yes, slot Y into state; otherwise fall back to city.
+    // For depth-2 (`Places/X/Y`), digiKam's own metadata-mode behaviour
+    // writes Y as the city. But user libraries also legitimately use depth-2
+    // as country+state (e.g. `Places/United States/Illinois`). When the
+    // offline cities database is available, ask it whether Y is a known
+    // admin1 (state) of country X — if yes, slot Y into state; otherwise
+    // fall back to city. The provider swallows its own errors and returns
+    // false on a missing/corrupted DB, so no outer try/catch is needed.
     const country = longest[0];
     let state: string | undefined;
     let city: string | undefined;
     if (longest.length === 2) {
       const second = longest[1];
       const provider = GeocodeProviderRegistry.get(OFFLINE_CITIES1000_PROVIDER);
-      let looksLikeState = false;
-      try {
-        looksLikeState = !!provider?.isAdmin1?.(country, second);
-      } catch (e) {
-        // Defensive: a malformed/corrupted geocoder DB throws here; we'd
-        // rather degrade to the original city-slot behaviour than fail the
-        // whole metadata load.
-        Logger.debug('[DigikamPlaceImport]',
-          `${fullPath ?? '<unknown>'} — isAdmin1 threw for ('${country}','${second}'): ${e}`);
-      }
-      if (looksLikeState) {
+      if (provider?.isAdmin1?.(country, second)) {
         state = second;
       } else {
         city = second;

@@ -28,9 +28,10 @@ export interface DirectoryBaseDTO<S extends FileDTO = MediaDTO>
   lastModified: number;
   lastScanned?: number;
   isPartial?: boolean;
-  // True when the backend returned this directory before its save-to-DB pipeline
-  // finished (e.g. F3 GPS synthesis still running). The frontend polls until the
-  // flag clears, then re-renders so map pins appear without a manual refresh.
+  // True when the backend returned this directory before its save-to-DB
+  // pipeline finished (e.g. synthesis of GPS from text location still
+  // running). The frontend polls until the flag clears, then re-renders so
+  // map pins appear without a manual refresh.
   syncing?: boolean;
   parent: DirectoryBaseDTO<S>;
   directories?: DirectoryBaseDTO<S>[];

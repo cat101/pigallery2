@@ -24,8 +24,9 @@ export class ContentLoaderService implements OnDestroy {
   private pollingSub: Subscription;
   // syncing-poll: when the backend returns `directory.syncing = true`, we
   // re-fetch the same dir every SYNCING_POLL_MS until the flag clears or
-  // SYNCING_POLL_CAP_MS elapses. Keeps the leaflet/map auto-updating after
-  // background F3 finishes without forcing the user to refresh manually.
+  // SYNCING_POLL_CAP_MS elapses. Keeps the gallery + map auto-updating
+  // after the backend's background indexing/synthesis finishes, without
+  // forcing the user to refresh manually.
   private syncingPollTimeout: ReturnType<typeof setTimeout> = null;
   private syncingPollDeadlineAt = 0;
   private readonly SYNCING_POLL_MS = 4000;
@@ -60,7 +61,7 @@ export class ContentLoaderService implements OnDestroy {
   }
 
   private scheduleSyncingPollIfNeeded(cw: PackedContentWrapperWithError | null): void {
-    const syncing = (cw as any)?.directory?.syncing === true;
+    const syncing = cw?.directory?.syncing === true;
     if (!syncing) {
       this.cancelSyncingPoll();
       return;

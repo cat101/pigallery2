@@ -627,6 +627,20 @@ export class PhotoLocationConfig {
   DigikamPlacesTagEnabled: boolean = false;
 
   @ConfigProperty({
+    type: 'string',
+    tags: {
+      // Name prefixed with the parent toggle's label so the admin UI's
+      // alphabetical-within-priority sort places this field directly under
+      // "Use Digikam Place tags".
+      name: $localize`Use Digikam Place tags — Default place for unlocated photos`,
+      priority: ConfigPriority.advanced,
+      relevant: (sub: PhotoLocationConfig) => sub.DigikamPlacesTagEnabled,
+    } as TAGS,
+    description: $localize`A Places-tree path (e.g., 'Places/Argentina/Cordoba') that pigallery2 treats as the default location for photos with no GPS, no IPTC location, and no Places tag at all. Nothing is written to disk or to the photo's data — but when you search 'position:(X)' and X matches any segment of this path, those unlocated photos also come up. Empty disables the behaviour. No map pins are added for these photos.`,
+  })
+  DefaultPlace: string = '';
+
+  @ConfigProperty({
     type: 'boolean',
     tags: {
       name: $localize`Reverse geocoding`,
@@ -647,6 +661,22 @@ export class PhotoLocationConfig {
     description: $localize`Puts text-only photos on the map. For each photo that has a country/city but no GPS — scanned negatives, very old photos, anything tagged by hand — pigallery2 picks a sensible coordinate: first by averaging GPS from your other photos at the same place, then by the city's centre in the cities database. Caveat: these synthesised pins look identical to real GPS pins on the map.`,
   })
   SyntheticGPSEnabled: boolean = false;
+
+  @ConfigProperty({
+    type: 'unsignedInt',
+    tags: {
+      // Name prefixed with the parent toggle's label so the admin UI's
+      // alphabetical-within-priority sort places this field directly under
+      // "Add GPS coordinates". Promoted from underTheHood → advanced so it
+      // groups with its parent (the priority sort runs before alphabetical).
+      name: $localize`Add GPS coordinates — Minimum library samples for centroid`,
+      priority: ConfigPriority.advanced,
+      relevant: (sub: PhotoLocationConfig) => sub.SyntheticGPSEnabled,
+      uiResetNeeded: {db: true},
+    } as TAGS,
+    description: $localize`How many GPS-bearing photos must exist at a (country, state, city) — or partial — group before its averaged centroid is preferred over the offline cities database. Defaults to 3; lower values are more aggressive but vulnerable to a single mis-located photo dragging every sibling-tagged photo to the wrong spot. Set to 1 to restore the original library-first-always behaviour.`,
+  })
+  SyntheticGPSMinLibSamples: number = 3;
 }
 
 @SubConfigClass({softReadonly: true})

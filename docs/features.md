@@ -26,7 +26,14 @@ When a photo carries only some of those fields, the **Photo Location** section i
 
 - **Use Digikam Place tags** reads digiKam's `Places/Country/State/City` hierarchical tags, so a tag like `Places/United States/Oregon/Portland` becomes searchable as `position:(Portland)` even on a scan with no GPS or IPTC fields.
 - **Reverse geocoding** turns raw GPS coordinates into country/state/city using a 15 MB cities database that ships with pigallery2 — no internet calls.
-- **Add GPS coordinates** does the reverse: for photos that have a text location but no GPS, it picks a coordinate (first by averaging your own library's GPS-bearing photos at the same place, then by the city centre in the cities database). These synthesised pins look identical to real GPS pins on the map.
+- **Add GPS coordinates** does the reverse: for photos that have a text location but no GPS, it picks a coordinate by walking from city to state to country, preferring an average of your own photos at the same place when there are enough of them, and falling back to the cities database otherwise. These synthesised pins look identical to real GPS pins on the map.
+
+A couple of extras live in the same admin section:
+
+- **Default place for unlocated photos** lets you point at a `Places/...` path so that searches like `position:(Cordoba)` also surface photos that have no location info at all. The default itself is never written into your photos.
+- **`places_overrides.json`**, a small file next to `config.json`, lets you pin a manual coordinate to a digiKam Places path for spots the cities database doesn't know (a family cabin, a specific neighbourhood). It only fills missing GPS — it never overwrites a real one.
+
+**Diacritic-insensitive search** (under *Admin → Search*) makes `position:(Cordoba)` also match `Córdoba`, and the other way around. SQLite-only.
 
 ### Advanced Searching
 Supports full boolean logic with negation and exact or wildcard search. It also provides handy suggestions with autocomplete.

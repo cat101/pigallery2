@@ -35,14 +35,22 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
     savedReverse = Config.Indexing.PhotoLocation.ReverseGeocodeEnabled;
     Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = false;
     Config.Indexing.PhotoLocation.ReverseGeocodeEnabled = false;
+    // Pin the places-overrides map to empty so tests aren't influenced by
+    // a real places_overrides.json bind-mounted into the dev container.
+    // Individual override-map tests below override this with their own
+    // __setForTesting call.
+    const {PlacesOverrides} = require('../../../../../src/backend/model/PlacesOverrides');
+    PlacesOverrides.__setForTesting({});
   });
 
   afterEach(() => {
     Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = savedDigikam;
     Config.Indexing.PhotoLocation.ReverseGeocodeEnabled = savedReverse;
+    const {PlacesOverrides} = require('../../../../../src/backend/model/PlacesOverrides');
+    PlacesOverrides.reset();
   });
 
-  describe('baseline (no F1/F2 enabled)', () => {
+  describe('baseline (digiKam tag reader + reverse-geocode disabled)', () => {
     it('keeps existing IPTC IIM + XMP-photoshop behavior', () => {
       const md = callMapToponyms({
         iptc: {Country: 'Japan', City: 'Shinjuku'},
@@ -84,7 +92,7 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
     });
   });
 
-  describe('F1: digiKam Places/... tag reader', () => {
+  describe('digiKam Places/... tag reader', () => {
     beforeEach(() => {
       Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = true;
     });
@@ -165,7 +173,7 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
       }
     });
 
-    it('fx-shinjuku-post-sync — IPTC values win; F1 does not overwrite', () => {
+    it('fx-shinjuku-post-sync — IPTC values win; the tag reader does not overwrite', () => {
       const md = callMapToponyms({
         iptc: {Country: 'Japan', City: 'Shinjuku'},
         photoshop: {Country: 'Japan', City: 'Shinjuku'},
@@ -243,7 +251,7 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
     });
   });
 
-  describe('F1 + Iptc4xmpExt interaction', () => {
+  describe('digiKam tag reader + Iptc4xmpExt interaction', () => {
     beforeEach(() => {
       Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = true;
     });
@@ -257,7 +265,7 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
     });
   });
 
-  describe('F1: edge cases', () => {
+  describe('digiKam tag reader: edge cases', () => {
     beforeEach(() => {
       Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = true;
     });
@@ -284,31 +292,114 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
       expect(md.positionData?.city).to.equal('Athens');
     });
 
-    it('falls back to city slot when the geocoder provider throws from isAdmin1', () => {
-      const KEY = 'offline-cities1000';
+    it('falls back to city slot when no geocoder provider is registered', () => {
+      // Without a provider, isAdmin1 cannot be consulted — depth-2 defaults
+      // to the city slot (digiKam's own metadata-mode behaviour).
       GeocodeProviderRegistry.reset();
-      GeocodeProviderRegistry.register(KEY, () => ({
-        ready: () => true,
-        reverse: () => undefined,
-        geocode: () => undefined,
-        isAdmin1: () => { throw new Error('boom'); },
-      }));
-      try {
-        const md = callMapToponyms({
-          digiKam: {TagsList: ['Places/United States/Illinois']},
-        });
-        // We swallow the throw and degrade to city slot.
-        expect(md.positionData).to.deep.equal({
-          country: 'United States',
-          city: 'Illinois',
-        });
-      } finally {
-        GeocodeProviderRegistry.reset();
-      }
+      const md = callMapToponyms({
+        digiKam: {TagsList: ['Places/United States/Illinois']},
+      });
+      expect(md.positionData).to.deep.equal({
+        country: 'United States',
+        city: 'Illinois',
+      });
+    });
+
+    it('picks the lexicographically-smallest path among same-depth ties (deterministic)', () => {
+      // Both paths have depth 3 — without a tie-break the choice would depend
+      // on input order. Reordering the inputs must not change the output.
+      const inputA = ['Places/A/X/Y', 'Places/A/B/C'];
+      const inputB = ['Places/A/B/C', 'Places/A/X/Y'];
+      const mdA = callMapToponyms({digiKam: {TagsList: inputA}});
+      const mdB = callMapToponyms({digiKam: {TagsList: inputB}});
+      expect(mdA.positionData).to.deep.equal(mdB.positionData);
+      // Lex-smallest of (A/B/C, A/X/Y) is A/B/C.
+      expect(mdA.positionData).to.deep.equal({country: 'A', state: 'B', city: 'C'});
     });
   });
 
-  describe('F2: regression — provider returns garbage', () => {
+  describe('places_overrides.json — manual leaf coords', () => {
+    const {PlacesOverrides} = require('../../../../../src/backend/model/PlacesOverrides');
+
+    beforeEach(() => {
+      Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = true;
+      PlacesOverrides.reset();
+    });
+
+    afterEach(() => {
+      PlacesOverrides.reset();
+    });
+
+    it('pins GPS to the override when the longest Places path matches exactly', () => {
+      PlacesOverrides.__setForTesting({
+        'Places/Argentina/Córdoba/Villa Allende/Casa del Abuel (Villa)':
+          {lat: -31.4399572, lon: -64.2025942},
+      });
+      const md = callMapToponyms({
+        digiKam: {TagsList: ['Places/Argentina/Córdoba/Villa Allende/Casa del Abuel (Villa)']},
+      });
+      expect(md.positionData?.GPSData?.latitude).to.equal(-31.439957);
+      expect(md.positionData?.GPSData?.longitude).to.equal(-64.202594);
+      // City slot remains the depth-≥4 result (leaf dropped) — override
+      // does NOT rewrite the city for position-search consistency.
+      expect(md.positionData?.country).to.equal('Argentina');
+      expect(md.positionData?.state).to.equal('Córdoba');
+      expect(md.positionData?.city).to.equal('Villa Allende');
+    });
+
+    it('does not match a shorter Places path when the photo has a longer one', () => {
+      // Override for Places/Argentina; photo tagged Places/Argentina/Buenos Aires.
+      // Longest path is depth-2 → no exact match → no GPS pin.
+      PlacesOverrides.__setForTesting({
+        'Places/Argentina': {lat: -38, lon: -64},
+      });
+      const md = callMapToponyms({
+        digiKam: {TagsList: ['Places/Argentina/Buenos Aires']},
+      });
+      expect(md.positionData?.GPSData).to.equal(undefined);
+      expect(md.positionData?.country).to.equal('Argentina');
+    });
+
+    it('matches a depth-1 override when the photo is tagged at depth 1', () => {
+      PlacesOverrides.__setForTesting({
+        'Places/Argentina': {lat: -31.43, lon: -64.20},
+      });
+      const md = callMapToponyms({
+        digiKam: {TagsList: ['Places/Argentina']},
+      });
+      expect(md.positionData?.GPSData?.latitude).to.equal(-31.43);
+      expect(md.positionData?.GPSData?.longitude).to.equal(-64.20);
+    });
+
+    it('does not overwrite an existing GPS (soft override only)', () => {
+      PlacesOverrides.__setForTesting({
+        'Places/A/B/C/Pinned': {lat: 10, lon: 20},
+      });
+      // Photo already has GPS from EXIF — override must not touch it.
+      const md: PhotoMetadata = {size: {width: 1, height: 1}, creationDate: 0, fileSize: 0};
+      md.positionData = {GPSData: {latitude: 50, longitude: 60}};
+      (MetadataLoader as any).mapToponyms(md, {
+        digiKam: {TagsList: ['Places/A/B/C/Pinned']},
+      });
+      expect(md.positionData.GPSData?.latitude).to.equal(50);
+      expect(md.positionData.GPSData?.longitude).to.equal(60);
+    });
+
+    it('is silent when DigikamPlacesTagEnabled is off', () => {
+      Config.Indexing.PhotoLocation.DigikamPlacesTagEnabled = false;
+      PlacesOverrides.__setForTesting({
+        'Places/Argentina': {lat: -31.43, lon: -64.20},
+      });
+      const md = callMapToponyms({
+        digiKam: {TagsList: ['Places/Argentina']},
+      });
+      expect(md.positionData?.GPSData).to.equal(undefined);
+      // The tag reader didn't run either — country slot stays empty.
+      expect(md.positionData?.country).to.equal(undefined);
+    });
+  });
+
+  describe('reverse-geocode: regression — provider returns garbage', () => {
     const KEY = 'offline-cities1000';
 
     beforeEach(() => {
@@ -342,7 +433,7 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
     });
   });
 
-  describe('F2: offline reverse-geocode (GPS → text)', () => {
+  describe('offline reverse-geocode (GPS → text)', () => {
     // The production code resolves Provider via the GeocodeProviderRegistryKey
     // map (enum → string). To inject a fake without touching that mapping,
     // register the fake under the same string key the default enum resolves to.

@@ -18,8 +18,9 @@ export interface GeocodeProvider {
   reverse(lat: number, lon: number, fullPath?: string): GeocodeResult | undefined;
   geocode(query: { country?: string; state?: string; city?: string }, fullPath?: string): GeocodeResult | undefined;
   // True when `name` is a known admin1 (state/province) of `country`.
-  // Used by F1 to disambiguate depth-2 tags like `Places/US/Illinois` where
-  // the second segment is actually a state.
+  // Used by the digiKam Places tag reader to disambiguate depth-2 tags like
+  // `Places/US/Illinois` where the second segment is actually a state, not
+  // the city the depth-2 city default would otherwise pick.
   isAdmin1(country: string, name: string): boolean;
   ready(): boolean;
 }
@@ -36,6 +37,7 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
   private countryForwardStmt: any = null;
   private admin1ExistsStmt: any = null;
   private cityByAdmin1CodeStmt: any = null;
+  private reverseWideStmt: any = null;
   private initTried = false;
 
   constructor(private readonly dbPath: string) {
@@ -124,7 +126,8 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
       LIMIT 1
     `);
     // True if `name` is a known admin1 of `country` (by name or ISO code).
-    // Used by F1's depth-2 disambiguation (state vs. city).
+    // Used by the digiKam Places tag reader's depth-2 disambiguation
+    // (state vs. city).
     this.admin1ExistsStmt = this.db.prepare(`
       SELECT 1 FROM admin1 a
       LEFT JOIN countries ctr ON ctr.code = a.country_code
@@ -146,6 +149,23 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
         AND c.admin1_code = :admin1Code COLLATE NOCASE
         AND (ctr.name = :country COLLATE NOCASE OR c.country_code = :country COLLATE NOCASE)
       ORDER BY c.population DESC
+      LIMIT 1
+    `);
+    // Fallback used when the ±1° lat window misses (oceans, polar coords).
+    // Same ranking formula as reverseStmt but with no lat pre-filter, so it
+    // does a full-table scan; rare path that should not happen for any
+    // photo with sensible coords.
+    this.reverseWideStmt = this.db.prepare(`
+      SELECT c.name AS city, c.lat AS lat, c.lon AS lon,
+             ctr.name AS country, a.name AS state
+      FROM cities c
+      LEFT JOIN countries ctr ON ctr.code = c.country_code
+      LEFT JOIN admin1 a ON a.country_code = c.country_code AND a.admin1_code = c.admin1_code
+      ORDER BY (
+        ((c.lat - :lat) * (c.lat - :lat)
+        + (c.lon - :lon) * (c.lon - :lon) * :cosLatSq)
+        / sqrt(MAX(c.population, 0) + 1.0)
+      ) ASC
       LIMIT 1
     `);
   }
@@ -172,22 +192,9 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
         cosLatSq: cosLat * cosLat,
       });
       if (!row) {
-        // Widen the window if first pass missed (oceans, polar coords).
         Logger.warn('[ReverseGeocode]',
           `${fullPath ?? '<unknown>'} — (${lat},${lon}) outside dense lat window; full-table scan`);
-        const wide = this.db.prepare(`
-          SELECT c.name AS city, c.lat AS lat, c.lon AS lon,
-                 ctr.name AS country, a.name AS state
-          FROM cities c
-          LEFT JOIN countries ctr ON ctr.code = c.country_code
-          LEFT JOIN admin1 a ON a.country_code = c.country_code AND a.admin1_code = c.admin1_code
-          ORDER BY (
-            ((c.lat - :lat) * (c.lat - :lat)
-            + (c.lon - :lon) * (c.lon - :lon) * :cosLatSq)
-            / sqrt(MAX(c.population, 0) + 1.0)
-          ) ASC
-          LIMIT 1
-        `).get({lat, lon, cosLatSq: cosLat * cosLat});
+        const wide = this.reverseWideStmt.get({lat, lon, cosLatSq: cosLat * cosLat});
         return wide ? this.toResult(wide) : undefined;
       }
       return this.toResult(row);
@@ -208,10 +215,10 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
           country: query.country ?? null,
         });
         if (row) return this.toResult(row);
-        // F1's depth-2 mapping puts the second tag segment into `city`, but
-        // some libraries tag `Places/Country/State` (state at depth-2) — see
-        // feat-location-search/README.md §3.2.4 caveat. Try the same value
-        // as a state before giving up on a finer-than-country lookup.
+        // The digiKam Places reader's depth-2 default puts the second tag
+        // segment into `city`, but some libraries tag `Places/Country/State`
+        // (state at depth-2). Try the same value as a state before giving up
+        // on a finer-than-country lookup.
         const asState = this.stateForwardStmt.get({
           state: query.city,
           country: query.country ?? null,
@@ -295,7 +302,8 @@ export class GeocodeProviderRegistry {
   }
 }
 
-// Helper used by F3 to round-trip a GPSMetadata into the geocode result type.
+// Helper used by the synthetic-GPS pass to round-trip a GPSMetadata into the
+// geocode result type.
 export function pickGPS(r: GeocodeResult | undefined): GPSMetadata | undefined {
   if (!r || r.latitude == null || r.longitude == null) return undefined;
   return {

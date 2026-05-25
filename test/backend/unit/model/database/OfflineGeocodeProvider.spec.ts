@@ -60,8 +60,8 @@ describeIfDb('OfflineCitiesGeocodeProvider', () => {
       });
 
       it('falls back to state when the supplied city is actually a state', () => {
-        // F1's depth-2 mapping puts state-segments in the city slot — the
-        // geocoder reinterprets them as state.
+        // The digiKam Places reader's depth-2 default puts state-segments
+        // in the city slot — the geocoder reinterprets them as state.
         const r = p.geocode({country: 'United States', city: 'Illinois'});
         expect(r?.state).to.equal('Illinois');
         expect(r?.city).to.equal(undefined);

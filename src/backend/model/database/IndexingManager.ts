@@ -23,6 +23,8 @@ import {PersonJunctionTable} from './enitites/person/PersonJunctionTable';
 import {MDFileEntity} from './enitites/MDFileEntity';
 import {MDFileDTO} from '../../../common/entities/MDFileDTO';
 import {DiskManager} from '../fileaccess/DiskManager';
+import {MetadataLoader} from '../fileaccess/MetadataLoader';
+import {AlbumManager} from './AlbumManager';
 import {ProjectedDirectoryCacheEntity} from './enitites/ProjectedDirectoryCacheEntity';
 
 const LOG_TAG = '[IndexingManager]';
@@ -63,6 +65,30 @@ export class IndexingManager {
             s.searchQuery,
             true
           );
+        }
+      }
+    }
+  }
+
+  // Create a saved-search album for every digiKam tag-tree path found on the
+  // media just indexed in this directory (paths were put into
+  // metadata.keywords by MetadataLoader.mapDigikamTagAlbums). Incremental and
+  // idempotent: new albums appear as soon as their folder is indexed/browsed.
+  // Pruning of removed tags is left to DigikamTagAlbumsJob (needs a full view).
+  private static async processDigikamTagAlbums(
+    dir: ParentDirectoryDTO
+  ): Promise<void> {
+    const prefixes = MetadataLoader.digikamAlbumPrefixes();
+    if (prefixes.length === 0 || !dir.media) {
+      return;
+    }
+    const seen = new Set<string>();
+    for (const m of dir.media) {
+      for (const kw of ((m.metadata as PhotoMetadata)?.keywords || [])) {
+        if (kw.indexOf('/') !== -1 && !seen.has(kw)
+          && prefixes.indexOf(AlbumManager.digikamTagRoot(kw)) !== -1) {
+          seen.add(kw);
+          await ObjectManagers.getInstance().AlbumManager.addDigikamTagAlbum(kw);
         }
       }
     }
@@ -124,6 +150,11 @@ export class IndexingManager {
       .createQueryBuilder('directory')
       .delete()
       .execute();
+    // Generated digiKam tag-tree albums are derived from the index; drop them
+    // so they don't survive the reset as orphans (they regenerate on re-index).
+    await ObjectManagers.getInstance().AlbumManager.deleteDigikamTagAlbums(
+      MetadataLoader.digikamAlbumPrefixes()
+    );
   }
 
   public async saveToDB(scannedDirectory: ParentDirectoryDTO): Promise<void> {
@@ -144,6 +175,7 @@ export class IndexingManager {
       await this.saveMedia(connection, currentDirId, scannedDirectory.media);
       await this.saveMetaFiles(connection, currentDirId, scannedDirectory);
       await IndexingManager.processServerSidePG2Conf(scannedDirectory, serverSideConfigs);
+      await IndexingManager.processDigikamTagAlbums(scannedDirectory);
       await ObjectManagers.getInstance().onDataChange(scannedDirectory);
     } finally {
       this.isSaving = false;

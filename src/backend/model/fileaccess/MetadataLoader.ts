@@ -297,6 +297,7 @@ export class MetadataLoader {
       MetadataLoader.mapImageDimensions(metadata, exif, orientation);
     }
     MetadataLoader.mapKeywords(metadata, exif);
+    MetadataLoader.mapDigikamTagAlbums(metadata, exif);
     MetadataLoader.mapTitle(metadata, exif);
     MetadataLoader.mapCaption(metadata, exif);
     MetadataLoader.mapTimestampAndOffset(metadata, exif);
@@ -368,6 +369,52 @@ export class MetadataLoader {
         }
       }
     }
+  }
+
+  // Expose configured digiKam tag-tree roots ("Albums/;About/") as bare first
+  // segments (["Albums", "About"]). Empty when the feature is off.
+  public static digikamAlbumPrefixes(): string[] {
+    if (!Config.Album?.digikamTagTree?.enabled) {
+      return [];
+    }
+    return (Config.Album.digikamTagTree.tagPrefixes || '')
+      .split(';')
+      .map((p): string => p.trim().replace(/\/+$/, ''))
+      .filter((p): boolean => p.length > 0);
+  }
+
+  // Push digiKam hierarchical tags that live under a configured prefix into
+  // metadata.keywords as their canonical "/"-joined full path (e.g.
+  // "Albums/Trips (highlights)/Mexico (2005)"). Read from digiKam:TagsList
+  // ("/" separator) and lr:hierarchicalSubject ("|"); de-duplicated. Segments
+  // are HTML-decoded so "&amp;" shows as "&" in the album name.
+  //
+  // keywords is a comma-joined `simple-array` column, so any literal "," in a
+  // value gets split into bogus keywords on read. digiKam album names commonly
+  // contain commas ("Espana, Londres, Paris (2013)"), so we replace commas with
+  // spaces (collapsing the run) — the album reads "Espana Londres Paris (2013)"
+  // and survives storage, search and the derived album name.
+  private static cleanTagSegment(s: string): string {
+    return Utils.decodeHTMLChars(s).split(',').join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  private static mapDigikamTagAlbums(metadata: PhotoMetadata, exif: any) {
+    const prefixes = MetadataLoader.digikamAlbumPrefixes();
+    if (prefixes.length === 0) {
+      return;
+    }
+    const add = (raw: any, sep: string) => {
+      for (const entry of (Array.isArray(raw) ? raw : [raw])) {
+        if (typeof entry !== 'string') continue;
+        const segs = entry.split(sep).filter((s): boolean => s.length > 0);
+        if (segs.length < 2 || prefixes.indexOf(segs[0]) === -1) continue;
+        const path = segs.map((s): string => MetadataLoader.cleanTagSegment(s)).join('/');
+        if (metadata.keywords === undefined) metadata.keywords = [];
+        if (metadata.keywords.indexOf(path) === -1) metadata.keywords.push(path);
+      }
+    };
+    add(exif.digiKam?.TagsList, '/');
+    add(exif.lr?.hierarchicalSubject, '|');
   }
 
   private static mapTitle(metadata: PhotoMetadata, exif: any) {

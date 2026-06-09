@@ -60,12 +60,32 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
       this.db = new Database(this.dbPath, {readonly: true, fileMustExist: true});
       this.db.pragma('journal_mode = OFF');
       this.db.pragma('synchronous = OFF');
+      // GeoNames records a handful of countries with a leading definite article
+      // (e.g. "The Netherlands") while EXIF/folder denominations use the bare
+      // name ("Netherlands"), so an exact name match misses and the photo is
+      // left without GPS. Register a deterministic helper that lowercases and
+      // strips a leading article, and apply it to both sides of every
+      // country-name comparison below — making the match article-insensitive in
+      // either direction. build-cities-db.js strips the same article at insert
+      // time, so against a rebuilt DB this is simply a no-op.
+      this.db.function('geo_canon', {deterministic: true},
+        (s: string | null) => OfflineCitiesGeocodeProvider.canonCountry(s));
       this.prepareStatements();
       Logger.info(LOG_TAG, `Loaded cities database from ${this.dbPath}`);
     } catch (e) {
       Logger.error(LOG_TAG, `Failed to open cities database: ${e}`);
       this.db = null;
     }
+  }
+
+  // Canonicalise a country name for comparison: lowercased, leading definite
+  // article stripped ("The Netherlands" → "netherlands"). Registered as the
+  // SQL `geo_canon` helper; see lazyInit for why.
+  private static canonCountry(s: string | null): string | null {
+    if (s == null) {
+      return null;
+    }
+    return s.trim().toLowerCase().replace(/^the\s+/, '');
   }
 
   private prepareStatements(): void {
@@ -100,7 +120,7 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
       LEFT JOIN countries ctr ON ctr.code = c.country_code
       LEFT JOIN admin1 a ON a.country_code = c.country_code AND a.admin1_code = c.admin1_code
       WHERE c.name = :city COLLATE NOCASE
-        AND (:country IS NULL OR ctr.name = :country COLLATE NOCASE OR c.country_code = :country COLLATE NOCASE)
+        AND (:country IS NULL OR geo_canon(ctr.name) = geo_canon(:country) OR c.country_code = :country COLLATE NOCASE)
       ORDER BY c.population DESC
       LIMIT 1
     `);
@@ -111,7 +131,7 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
       LEFT JOIN countries ctr ON ctr.code = c.country_code
       LEFT JOIN admin1 a ON a.country_code = c.country_code AND a.admin1_code = c.admin1_code
       WHERE a.name = :state COLLATE NOCASE
-        AND (:country IS NULL OR ctr.name = :country COLLATE NOCASE OR c.country_code = :country COLLATE NOCASE)
+        AND (:country IS NULL OR geo_canon(ctr.name) = geo_canon(:country) OR c.country_code = :country COLLATE NOCASE)
       GROUP BY ctr.name, a.name
       ORDER BY COUNT(*) DESC
       LIMIT 1
@@ -121,7 +141,7 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
              ctr.name AS country
       FROM cities c
       LEFT JOIN countries ctr ON ctr.code = c.country_code
-      WHERE ctr.name = :country COLLATE NOCASE OR c.country_code = :country COLLATE NOCASE
+      WHERE geo_canon(ctr.name) = geo_canon(:country) OR c.country_code = :country COLLATE NOCASE
       GROUP BY ctr.name
       LIMIT 1
     `);
@@ -132,7 +152,7 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
       SELECT 1 FROM admin1 a
       LEFT JOIN countries ctr ON ctr.code = a.country_code
       WHERE a.name = :name COLLATE NOCASE
-        AND (ctr.name = :country COLLATE NOCASE OR a.country_code = :country COLLATE NOCASE)
+        AND (geo_canon(ctr.name) = geo_canon(:country) OR a.country_code = :country COLLATE NOCASE)
       LIMIT 1
     `);
     // City name within a specific admin1 (by code) and country (by name or
@@ -147,7 +167,7 @@ export class OfflineCitiesGeocodeProvider implements GeocodeProvider {
       LEFT JOIN admin1 a ON a.country_code = c.country_code AND a.admin1_code = c.admin1_code
       WHERE c.name = :city COLLATE NOCASE
         AND c.admin1_code = :admin1Code COLLATE NOCASE
-        AND (ctr.name = :country COLLATE NOCASE OR c.country_code = :country COLLATE NOCASE)
+        AND (geo_canon(ctr.name) = geo_canon(:country) OR c.country_code = :country COLLATE NOCASE)
       ORDER BY c.population DESC
       LIMIT 1
     `);

@@ -88,7 +88,11 @@ function build() {
       if (!line || line.startsWith('#')) continue;
       const f = line.split('\t');
       if (f.length < 5 || !f[0] || !f[4]) continue;
-      insCtr.run(f[0], f[4]);
+      // Strip a leading definite article so the stored name matches the bare
+      // denomination EXIF/folders use ("The Netherlands" → "Netherlands"). The
+      // geocoder normalizes the same way at query time (geo_canon), so this
+      // just keeps a freshly-built DB consistent with the deployed one.
+      insCtr.run(f[0], f[4].replace(/^The\s+/, ''));
     }
   })();
 

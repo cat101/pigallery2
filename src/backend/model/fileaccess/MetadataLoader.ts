@@ -623,7 +623,11 @@ export class MetadataLoader {
     };
     collect(exif.digiKam?.TagsList, '/');
     if (paths.length === 0) {
-      collect(exif.lr?.HierarchicalSubject, '|');
+      // Lowercase 'h'. exifr returns XMP property names verbatim and the
+      // Lightroom schema defines lr:hierarchicalSubject, so the capitalised
+      // spelling silently matched nothing. mapKeywords() a few hundred lines
+      // up already reads the correct key.
+      collect(exif.lr?.hierarchicalSubject, '|');
     }
     if (paths.length === 0) return;
     // Pick the longest path; tie-break by lexicographic order of the joined

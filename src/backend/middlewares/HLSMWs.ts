@@ -18,9 +18,48 @@ interface HLSJob {
   segmentCount: number;
   command: FfmpegCommand | null;
   done: boolean;
+  // FFmpeg exited non-zero and no usable output was produced. Distinct from
+  // `done`: a failed job must never be served, and must never be adopted from
+  // disk on a later request.
+  failed: boolean;
 }
 
 const activeJobs = new Map<string, HLSJob>();
+
+/**
+ * Is a playlist on disk a transcode we can actually serve?
+ *
+ * `#EXT-X-ENDLIST` alone is not the answer, which is the trap this function
+ * exists for: the HLS muxer writes ENDLIST on its way out even when FFmpeg
+ * aborts mid-stream. A crashed `-c copy` therefore leaves behind a playlist
+ * that looks finished, and treating ENDLIST as "complete" makes the wreckage
+ * permanent — it is re-served on every later request and survives restarts.
+ *
+ * A playlist is usable only if it also declares real media: a non-zero
+ * TARGETDURATION and at least one segment with a non-zero duration. Copying
+ * from a container that carries no packet timestamps (AVI) produces exactly
+ * the opposite — `#EXT-X-TARGETDURATION:0` and `#EXTINF:0.000000` — which
+ * hls.js reads as a complete playlist containing nothing, and stalls on
+ * forever.
+ */
+function isUsablePlaylist(content: string): boolean {
+  if (!content.includes('#EXT-X-ENDLIST')) {
+    return false;
+  }
+  let targetDuration = 0;
+  let hasRealSegment = false;
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+      targetDuration = parseFloat(line.substring('#EXT-X-TARGETDURATION:'.length)) || 0;
+    } else if (line.startsWith('#EXTINF:')) {
+      if (parseFloat(line.substring('#EXTINF:'.length)) > 0) {
+        hasRealSegment = true;
+      }
+    }
+  }
+  return targetDuration > 0 && hasRealSegment;
+}
 
 async function detectCodecs(
   videoPath: string
@@ -54,16 +93,40 @@ async function detectCodecs(
 function spawnHLSJob(
   inputPath: string,
   cacheDir: string,
-  transmuxMode: boolean
+  transmuxMode: boolean,
+  onError: (err: Error) => void
 ): FfmpegCommand {
   const ffmpeg = FFmpegFactory.get();
   const outputPlaylist = path.join(cacheDir, 'playlist.m3u8');
   const segmentPattern = path.join(cacheDir, 'segment_%03d.m4s');
 
-  const cmd: FfmpegCommand = ffmpeg(inputPath);
+  const cmd: FfmpegCommand = ffmpeg(inputPath)
+    // Reconstruct missing presentation timestamps at the DEMUXER, before any
+    // muxing decision is made. An input option, so it must be added here and
+    // not below with the output flags.
+    //
+    // AVI records a global frame rate in its header and no per-packet PTS/DTS.
+    // With `-c copy` there is no decoder in the pipeline to derive them, so
+    // FFmpeg hands the fMP4 muxer packets with unset timestamps ("pts has no
+    // value", repeated once per frame) and the muxer, having no durations to
+    // add up, emits `#EXT-X-TARGETDURATION:0` and a single `#EXTINF:0.000000`.
+    // +genpts makes the demuxer generate them from the header frame rate.
+    //
+    // Harmless where timestamps already exist — mp4/mkv/ts are unaffected.
+    .inputOptions(['-fflags', '+genpts']);
 
   if (transmuxMode) {
-    cmd.videoCodec('copy').audioCodec('copy');
+    cmd.videoCodec('copy').audioCodec('copy')
+      // MPEG-TS carries AAC in ADTS framing, which fMP4 cannot hold: the muxer
+      // refuses with "Malformed AAC bitstream detected: use the audio bitstream
+      // filter 'aac_adtstoasc'" and the whole job dies after a handful of
+      // frames. The filter rewrites ADTS headers into the AudioSpecificConfig
+      // form fMP4 wants.
+      //
+      // Unconditional on purpose: it keys off the ADTS syncword and passes
+      // non-ADTS packets through untouched, so it is a no-op for the inputs
+      // that never needed it.
+      .addOption('-bsf:a', 'aac_adtstoasc');
   } else {
     cmd
       .videoCodec('libx264')
@@ -101,6 +164,7 @@ function spawnHLSJob(
     })
     .on('error', (err: Error) => {
       Logger.error('[HLSMWs] FFmpeg error for ' + inputPath + ':', err.message);
+      onError(err);
     })
     .save(outputPlaylist);
 
@@ -131,15 +195,20 @@ async function getOrStartJob(fullMediaPath: string): Promise<HLSJob> {
   const playlistPath = path.join(cacheDir, 'playlist.m3u8');
   try {
     const content = await fsp.readFile(playlistPath, 'utf8');
-    if (content.includes('#EXT-X-ENDLIST')) {
+    if (isUsablePlaylist(content)) {
       // Complete cached transcode — serve instantly
       const {duration} = await detectCodecs(fullMediaPath);
       const segmentCount = Math.ceil(duration / SEGMENT_DURATION_SEC);
-      const job: HLSJob = {cacheDir, duration, segmentCount, command: null, done: true};
+      const job: HLSJob = {
+        cacheDir, duration, segmentCount, command: null, done: true, failed: false,
+      };
       activeJobs.set(cacheDir, job);
       return job;
     }
-    // Incomplete playlist (interrupted transcode) — delete and re-transcode
+    // Either an interrupted transcode (no ENDLIST) or one that finished-looking
+    // but declares no playable media (a crashed `-c copy`). Neither can be
+    // served, and adopting the second kind is what made a broken stream
+    // permanent. Delete and re-transcode.
     await fsp.rm(cacheDir, {recursive: true, force: true});
   } catch {
     // not cached yet — fall through
@@ -150,17 +219,64 @@ async function getOrStartJob(fullMediaPath: string): Promise<HLSJob> {
 
   await fsp.mkdir(cacheDir, {recursive: true});
 
-  const transmuxMode = video === 'h264' && (audio === 'aac' || audio === 'mp3');
-  const cmd = spawnHLSJob(fullMediaPath, cacheDir, transmuxMode);
-
-  const job: HLSJob = {cacheDir, duration, segmentCount, command: cmd, done: false};
+  const job: HLSJob = {
+    cacheDir, duration, segmentCount, command: null, done: false, failed: false,
+  };
   activeJobs.set(cacheDir, job);
+
+  // Codec names are not enough to decide whether `-c copy` will work, and this
+  // check used to be the whole decision. Two things it cannot see also decide
+  // it: whether the container carries per-packet timestamps, and how the
+  // elementary stream is framed. h264+aac in an AVI and in an MPEG-TS both pass
+  // this test and both used to fail — differently.
+  //
+  // So the fast path is now an attempt rather than a prediction: try it, and
+  // when FFmpeg actually fails, fall back to the full re-encode that works for
+  // everything. A client already long-polling the playlist sees only a slightly
+  // later first segment; it does not need to know which path produced it.
+  const start: (transmux: boolean) => void = (transmux) => {
+    job.command = spawnHLSJob(fullMediaPath, cacheDir, transmux, () => {
+      void (async () => {
+        // Remove the partial output before anything can adopt it: the HLS muxer
+        // writes #EXT-X-ENDLIST even when FFmpeg aborts, so what is on disk
+        // right now looks like a finished transcode to getOrStartJob.
+        try {
+          await fsp.rm(cacheDir, {recursive: true, force: true});
+        } catch {
+          // Already gone, or never created. Either is fine.
+        }
+        if (transmux) {
+          Logger.warn('[HLSMWs] stream copy failed for ' + fullMediaPath
+            + ' — falling back to a full re-encode');
+          try {
+            await fsp.mkdir(cacheDir, {recursive: true});
+            start(false);
+            return;
+          } catch (e) {
+            Logger.error('[HLSMWs] could not start the re-encode fallback for '
+              + fullMediaPath + ': ' + e);
+          }
+        }
+        // Re-encoding failed too (or could not be started). Mark the job so the
+        // request handlers answer with an error instead of serving whatever
+        // FFmpeg left behind.
+        job.failed = true;
+      })();
+    });
+  };
+  start(video === 'h264' && (audio === 'aac' || audio === 'mp3'));
   return job;
 }
 
-async function waitForFile(filePath: string): Promise<boolean> {
+async function waitForFile(filePath: string, job: HLSJob): Promise<boolean> {
   const deadline = Date.now() + SEGMENT_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    // A failed job will never produce the file. Without this the request sat
+    // out the full SEGMENT_WAIT_TIMEOUT_MS and then reported a timeout, which
+    // reads as "slow" rather than "this cannot be transcoded".
+    if (job.failed) {
+      return false;
+    }
     try {
       await fsp.access(filePath);
       return true;
@@ -196,7 +312,8 @@ const FIRST_RESPONSE_WAIT_MS = 3_000; // max extra wait for first response
  *   new segment appears — pushes the response as soon as FFmpeg is done,
  *   eliminating hls.js's poll-interval lag entirely.
  */
-async function waitForNewContent(cacheDir: string, knownSegmentCount = 0): Promise<boolean> {
+async function waitForNewContent(job: HLSJob, knownSegmentCount = 0): Promise<boolean> {
+  const cacheDir = job.cacheDir;
   const playlistPath = path.join(cacheDir, 'playlist.m3u8');
   const initPath = path.join(cacheDir, 'init.mp4');
 
@@ -220,6 +337,12 @@ async function waitForNewContent(cacheDir: string, knownSegmentCount = 0): Promi
 
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, SEGMENT_POLL_INTERVAL_MS));
+    // See waitForFile: stop waiting for output that is never coming. Note this
+    // is NOT reached during the re-encode fallback — that path deletes and
+    // recreates the cache dir without setting `failed`, so the loop's ENOENT
+    // catch below keeps it polling and the client transparently picks up the
+    // fallback's segments.
+    if (job.failed) return false;
     try {
       const content = await fsp.readFile(playlistPath, 'utf8');
       if (content.includes('#EXT-X-ENDLIST')) return true;
@@ -271,6 +394,14 @@ export class HLSMWs {
 
       const playlistPath = path.join(job.cacheDir, 'playlist.m3u8');
 
+      if (job.failed) {
+        // FFmpeg could not produce a stream for this file, stream copy and
+        // re-encode both. Answering 500 is the point: this used to be a 200
+        // carrying whatever FFmpeg wrote before it died.
+        res.status(500).json({message: 'Video could not be transcoded'});
+        return;
+      }
+
       if (job.done) {
         // Complete cached transcode — serve instantly, no special cache headers needed
         // (URL already contains SHA256 hash so it's effectively immutable)
@@ -282,9 +413,13 @@ export class HLSMWs {
       // Long-poll: hold the connection until FFmpeg writes a new segment (or ENDLIST).
       // This eliminates hls.js's fixed poll interval lag — the server responds the
       // moment new content is available (~100 ms after FFmpeg flushes the segment).
-      const ready = await waitForNewContent(job.cacheDir);
+      const ready = await waitForNewContent(job);
       if (!ready) {
-        res.status(503).json({message: 'Playlist not ready in time'});
+        if (job.failed) {
+          res.status(500).json({message: 'Video could not be transcoded'});
+        } else {
+          res.status(503).json({message: 'Playlist not ready in time'});
+        }
         return;
       }
 
@@ -327,9 +462,13 @@ export class HLSMWs {
       const job = await getOrStartJob(fullMediaPath);
       const filePath = path.join(job.cacheDir, filename);
 
-      const ready = await waitForFile(filePath);
+      const ready = await waitForFile(filePath, job);
       if (!ready) {
-        res.status(503).json({message: 'Segment not ready in time'});
+        if (job.failed) {
+          res.status(500).json({message: 'Video could not be transcoded'});
+        } else {
+          res.status(503).json({message: 'Segment not ready in time'});
+        }
         return;
       }
 

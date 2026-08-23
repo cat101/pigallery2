@@ -280,5 +280,58 @@ describe('HLSMWs', () => {
 
       expect(oldContentStillThere).to.be.false;
     });
+
+    it('should NOT adopt a finished-looking playlist that declares no media', async () => {
+      // The guard that generalises. #EXT-X-ENDLIST alone does not mean a
+      // transcode succeeded: the HLS muxer writes it even when FFmpeg aborts
+      // mid-stream, so a crashed job leaves a playlist that looks complete.
+      // Adopting it made the failure permanent for that file — every later
+      // request re-served the wreck without re-running FFmpeg, across restarts.
+      //
+      // This is exactly the shape a `-c copy` from a timestamp-less container
+      // used to leave behind: ENDLIST present, TARGETDURATION 0, one segment
+      // declaring zero duration.
+      Config.Media.Video.liveVideoTranscodingEnabled = true;
+      Config.Media.folder = ASSETS_DIR;
+      ProjectPath.reset();
+
+      const fullPath = path.join(ASSETS_DIR, REAL_VIDEO);
+      const stat = await fs.promises.stat(fullPath);
+      const hash = crypto.createHash('sha256')
+        .update(fullPath + stat.mtimeMs.toString())
+        .digest('hex');
+      const cacheDir = path.join(ProjectPath.TempFolder, 'hls', hash);
+      await fs.promises.mkdir(cacheDir, {recursive: true});
+
+      const brokenButComplete = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-TARGETDURATION:0',
+        '#EXT-X-MAP:URI="init.mp4"',
+        '#EXTINF:0.000000,',
+        'segment_000.m4s',
+        '#EXT-X-ENDLIST',
+        '',
+      ].join('\n');
+      await fs.promises.writeFile(path.join(cacheDir, 'playlist.m3u8'), brokenButComplete);
+
+      HLSMWs.servePlaylist(makeReq({mediaPath: REAL_VIDEO}) as any, makeRes() as any, () => {})
+        .then((): void => undefined).catch((): void => undefined);
+
+      await new Promise(r => setTimeout(r, 500));
+
+      let stillServingTheWreck = false;
+      try {
+        const content = await fs.promises.readFile(path.join(cacheDir, 'playlist.m3u8'), 'utf8');
+        stillServingTheWreck = content.includes('#EXT-X-TARGETDURATION:0');
+      } catch { /* deleted and not yet rewritten — the desired outcome */ }
+
+      HLSMWs.killAllJobs();
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(stillServingTheWreck,
+        'a complete-looking playlist declaring no media was adopted as a valid transcode')
+        .to.be.false;
+    });
   });
 });

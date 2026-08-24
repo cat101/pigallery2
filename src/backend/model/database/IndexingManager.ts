@@ -707,6 +707,7 @@ export class IndexingManager {
     const CTY = 'metadataPositionDataCity';
     const LAT = 'metadataPositionDataGPSDataLatitude';
     const LON = 'metadataPositionDataGPSDataLongitude';
+    const SYN = 'metadataPositionDataGPSDataSynthesized';
     const centroidRows: CentroidRow[] = await connection
       .createQueryBuilder()
       .select(CC, 'country')
@@ -719,6 +720,12 @@ export class IndexingManager {
       .where(`${LAT} IS NOT NULL`)
       .andWhere(`${LON} IS NOT NULL`)
       .andWhere(`${CC} IS NOT NULL`)
+      // Real GPS only. Without this the pass counts its OWN output as evidence:
+      // a photo centroided to a country midpoint becomes a "GPS sample" for the
+      // city triple it is tagged with, and the next directory to be saved
+      // inherits the error. Measured on the fixtures, that dragged four accurate
+      // Córdoba anchors 17 km.
+      .andWhere(`(${SYN} IS NULL OR ${SYN} = 0)`)
       .groupBy(CC)
       .addGroupBy(SC)
       .addGroupBy(CTY)
@@ -766,7 +773,13 @@ export class IndexingManager {
       .addSelect('d.name', 'dirName')
       .from(mediaTable, 'media')
       .innerJoin(dirTable, 'd', 'd.id = media.directoryId')
-      .where(`media.${LAT} IS NULL`)
+      // Rows with no GPS, PLUS rows this pass wrote earlier. Revisiting our own
+      // output is what makes the result independent of the order directories are
+      // saved in: the per-directory call necessarily decides from a partial
+      // library, and the end-of-index call then recomputes it from the whole one.
+      // It is also what lets a bad value heal — before, `LAT IS NULL` alone meant
+      // the first writer won permanently, even across re-indexes.
+      .where(`(media.${LAT} IS NULL OR media.${SYN} = 1)`)
       .andWhere(`media.${CC} IS NOT NULL`);
     if (parentDirId != null) {
       targetsQB.andWhere('media.directoryId = :dirId', {dirId: parentDirId});
@@ -785,7 +798,7 @@ export class IndexingManager {
     let skipped = 0;
     // Build a single UPDATE per row via raw SQL — bypasses TypeORM property-path
     // translation issues for embedded fields.
-    const updateStmt = `UPDATE "${mediaTable}" SET "${LAT}" = ?, "${LON}" = ? WHERE id = ?`;
+    const updateStmt = `UPDATE "${mediaTable}" SET "${LAT}" = ?, "${LON}" = ?, "${SYN}" = 1 WHERE id = ?`;
     const rawUpdate = async (lat: number, lon: number, id: number) => {
       await connection.query(updateStmt, [lat, lon, id]);
     };
@@ -894,7 +907,8 @@ export class IndexingManager {
       if (inMem) {
         const pm = (inMem as PhotoEntity).metadata as PhotoMetadata;
         pm.positionData = pm.positionData || {};
-        pm.positionData.GPSData = {latitude: lat6, longitude: lon6};
+        // Mirror the flag too, so the response tells the same truth as the row.
+        pm.positionData.GPSData = {latitude: lat6, longitude: lon6, synthesized: true};
       }
       if (pickSrc) srcCount[pickSrc]++;
       updated++;

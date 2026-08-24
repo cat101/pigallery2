@@ -40,6 +40,7 @@ async function seedMedia(dirId: number, args: {
   city?: string | null;
   lat?: number | null;
   lon?: number | null;
+  synthesized?: boolean | null;
 }): Promise<number> {
   const conn = await SQLConnection.getConnection();
   const r = await conn.query(
@@ -49,22 +50,27 @@ async function seedMedia(dirId: number, args: {
         metadataSizeWidth, metadataSizeHeight,
         metadataPositionDataCountry, metadataPositionDataState,
         metadataPositionDataCity, metadataPositionDataGPSDataLatitude,
-        metadataPositionDataGPSDataLongitude, metadataRating, metadataPersonslength)
-     VALUES (?, 'PhotoEntity', ?, 0, 0, 1, 1, 1, ?, ?, ?, ?, ?, 0, 0)`,
+        metadataPositionDataGPSDataLongitude, metadataPositionDataGPSDataSynthesized,
+        metadataRating, metadataPersonslength)
+     VALUES (?, 'PhotoEntity', ?, 0, 0, 1, 1, 1, ?, ?, ?, ?, ?, ?, 0, 0)`,
     [args.name, dirId,
       args.country ?? null, args.state ?? null, args.city ?? null,
-      args.lat ?? null, args.lon ?? null]);
+      args.lat ?? null, args.lon ?? null,
+      args.synthesized == null ? null : (args.synthesized ? 1 : 0)]);
   return r as number;
 }
 
-async function getGPS(name: string): Promise<{lat: number | null; lon: number | null}> {
+async function getGPS(name: string): Promise<{
+  lat: number | null; lon: number | null; synthesized: number | null;
+}> {
   const conn = await SQLConnection.getConnection();
   const rows = await conn.query(
     'SELECT metadataPositionDataGPSDataLatitude AS lat,'
-    + ' metadataPositionDataGPSDataLongitude AS lon'
+    + ' metadataPositionDataGPSDataLongitude AS lon,'
+    + ' metadataPositionDataGPSDataSynthesized AS synthesized'
     + ' FROM media_entity WHERE name = ?', [name]);
   const r = rows[0];
-  return {lat: r?.lat ?? null, lon: r?.lon ?? null};
+  return {lat: r?.lat ?? null, lon: r?.lon ?? null, synthesized: r?.synthesized ?? null};
 }
 
 describe('IndexingManager.synthesizeGPS', (sqlHelper: DBTestHelper) => {
@@ -276,6 +282,97 @@ describe('IndexingManager.synthesizeGPS', (sqlHelper: DBTestHelper) => {
     expect(r.updated).to.equal(1);
     expect((await getGPS('other.jpg')).lat).to.equal(null);
     expect((await getGPS('target.jpg')).lat).to.equal(1);
+  });
+
+  // --- the synthesized flag -------------------------------------------------
+  // These five cover the defect the flag exists for. Before it, synthesizeGPS
+  // could not tell its own output from real GPS, so it fed on it.
+
+  it('marks what it writes, and leaves real GPS unmarked', async () => {
+    await seedMedia(dirId, {name: 'anchor1.jpg', country: 'A', state: 'B', city: 'C', lat: 10, lon: 20});
+    await seedMedia(dirId, {name: 'anchor2.jpg', country: 'A', state: 'B', city: 'C', lat: 12, lon: 22});
+    await seedMedia(dirId, {name: 'anchor3.jpg', country: 'A', state: 'B', city: 'C', lat: 14, lon: 24});
+    await seedMedia(dirId, {name: 'target.jpg', country: 'A', state: 'B', city: 'C'});
+    await new IndexingManager().synthesizeGPS(dirId);
+    expect((await getGPS('target.jpg')).synthesized).to.equal(1);
+    expect((await getGPS('anchor1.jpg')).synthesized).to.equal(null);
+  });
+
+  it('does NOT count a synthesized row as a centroid sample', async () => {
+    // THE bug. Two real anchors at (10,20) and (12,22) — mean (11,21). A third
+    // row at (1000,1000) is present but synthesized, so it must be invisible to
+    // the aggregate. Counting it would give a mean of ~(340,347) instead.
+    //
+    // Threshold is 3, and only 2 rows are real, so lib-city must MISS and the
+    // provider must answer — which is itself the observable: if the synthesized
+    // row were counted, n would be 3, lib-city would win and the provider would
+    // never be called.
+    await seedMedia(dirId, {name: 'real1.jpg', country: 'A', state: 'B', city: 'C', lat: 10, lon: 20});
+    await seedMedia(dirId, {name: 'real2.jpg', country: 'A', state: 'B', city: 'C', lat: 12, lon: 22});
+    await seedMedia(dirId, {name: 'fake.jpg', country: 'A', state: 'B', city: 'C',
+      lat: 1000, lon: 1000, synthesized: true});
+    await seedMedia(dirId, {name: 'target.jpg', country: 'A', state: 'B', city: 'C'});
+    let providerCalled = false;
+    GeocodeProviderRegistry.register(KEY, () => ({
+      ready: () => true,
+      reverse: () => undefined,
+      geocode: () => {
+        providerCalled = true;
+        return {country: 'A', state: 'B', city: 'C', latitude: 55, longitude: 66};
+      },
+      isAdmin1: () => false,
+    }));
+    await new IndexingManager().synthesizeGPS(dirId);
+    expect(providerCalled, 'the synthesized row was counted as a real sample').to.equal(true);
+    const g = await getGPS('target.jpg');
+    expect(g.lat).to.equal(55);
+    expect(g.lon).to.equal(66);
+  });
+
+  it('revisits a row it synthesized earlier, instead of first-writer-wins', async () => {
+    // A row already carrying a synthesized value, and enough real anchors to
+    // answer properly now. `LAT IS NULL` alone would skip it forever.
+    await seedMedia(dirId, {name: 'anchor1.jpg', country: 'A', state: 'B', city: 'C', lat: 10, lon: 20});
+    await seedMedia(dirId, {name: 'anchor2.jpg', country: 'A', state: 'B', city: 'C', lat: 12, lon: 22});
+    await seedMedia(dirId, {name: 'anchor3.jpg', country: 'A', state: 'B', city: 'C', lat: 14, lon: 24});
+    await seedMedia(dirId, {name: 'stale.jpg', country: 'A', state: 'B', city: 'C',
+      lat: -99, lon: -99, synthesized: true});
+    const r = await new IndexingManager().synthesizeGPS(dirId);
+    expect(r.updated).to.equal(1);
+    const g = await getGPS('stale.jpg');
+    expect(g.lat).to.equal(12);   // recomputed from the real anchors
+    expect(g.lon).to.equal(22);
+    expect(g.synthesized).to.equal(1);
+  });
+
+  it('never overwrites real GPS', async () => {
+    await seedMedia(dirId, {name: 'anchor1.jpg', country: 'A', state: 'B', city: 'C', lat: 10, lon: 20});
+    await seedMedia(dirId, {name: 'anchor2.jpg', country: 'A', state: 'B', city: 'C', lat: 12, lon: 22});
+    await seedMedia(dirId, {name: 'anchor3.jpg', country: 'A', state: 'B', city: 'C', lat: 14, lon: 24});
+    await new IndexingManager().synthesizeGPS(dirId);
+    for (const [n, lat] of [['anchor1.jpg', 10], ['anchor2.jpg', 12], ['anchor3.jpg', 14]] as [string, number][]) {
+      const g = await getGPS(n);
+      expect(g.lat, n).to.equal(lat);
+      expect(g.synthesized, n).to.equal(null);
+    }
+  });
+
+  it('is idempotent — running twice changes nothing', async () => {
+    // Guards the revisit path introduced above, and only means something WITH
+    // it: the second run now genuinely recomputes this row, so it could drift.
+    // Before the fix this passed for the empty reason — `LAT IS NULL` meant the
+    // second run found no targets at all. Kept because the revisit path is new
+    // and drift there would be silent, not because it would have caught the
+    // original bug; the two tests above are the ones that do that.
+    await seedMedia(dirId, {name: 'anchor1.jpg', country: 'A', state: 'B', city: 'C', lat: 10, lon: 20});
+    await seedMedia(dirId, {name: 'anchor2.jpg', country: 'A', state: 'B', city: 'C', lat: 12, lon: 22});
+    await seedMedia(dirId, {name: 'anchor3.jpg', country: 'A', state: 'B', city: 'C', lat: 14, lon: 24});
+    await seedMedia(dirId, {name: 'target.jpg', country: 'A', state: 'B', city: 'C'});
+    await new IndexingManager().synthesizeGPS(dirId);
+    const first = await getGPS('target.jpg');
+    await new IndexingManager().synthesizeGPS(dirId);
+    const second = await getGPS('target.jpg');
+    expect(second).to.deep.equal(first);
   });
 
   it('mirrors the synthesised GPS back into a provided patchMedia array', async () => {

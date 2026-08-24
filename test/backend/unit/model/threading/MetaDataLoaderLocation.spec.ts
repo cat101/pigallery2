@@ -224,11 +224,25 @@ describe('MetadataLoader.mapToponyms — location search features', () => {
       });
     });
 
-    it('falls back to lr:HierarchicalSubject when digiKam:TagsList absent', () => {
+    it('falls back to lr:hierarchicalSubject when digiKam:TagsList absent', () => {
+      // Lowercase 'h'. exifr returns XMP property names verbatim and the
+      // Lightroom schema defines lr:hierarchicalSubject, so this is the only
+      // spelling that exists in a real sidecar.
+      const md = callMapToponyms({
+        lr: {hierarchicalSubject: ['Places|Japan|Sumida']},
+      });
+      expect(md.positionData).to.deep.equal({country: 'Japan', city: 'Sumida'});
+    });
+
+    it('does NOT read the capitalised lr:HierarchicalSubject', () => {
+      // Pins the fix. The collector used to read the capitalised spelling, which
+      // exifr never emits, so the fallback silently did nothing for any library
+      // tagged only in Lightroom. This test is what keeps the typo from coming
+      // back — it came from a table in the feature's own design doc once already.
       const md = callMapToponyms({
         lr: {HierarchicalSubject: ['Places|Japan|Sumida']},
       });
-      expect(md.positionData).to.deep.equal({country: 'Japan', city: 'Sumida'});
+      expect(md.positionData).to.equal(undefined);
     });
 
     it('ignores non-Places hierarchical entries', () => {

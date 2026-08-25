@@ -18,16 +18,16 @@ interface HLSJob {
   segmentCount: number;
   command: FfmpegCommand | null;
   done: boolean;
-  // FFmpeg exited non-zero and no usable output was produced. Distinct from
-  // `done`: a failed job must never be served, and must never be adopted from
-  // disk on a later request.
+  // FFmpeg produced no usable output — whether it crashed or exited 0 with a
+  // playlist that declares no media. Distinct from `done`: a failed job must
+  // never be served, and must never be adopted from disk on a later request.
   failed: boolean;
 }
 
 const activeJobs = new Map<string, HLSJob>();
 
 /**
- * Is a playlist on disk a transcode we can actually serve?
+ * Is a playlist a transcode we can actually serve?
  *
  * `#EXT-X-ENDLIST` alone is not the answer, which is the trap this function
  * exists for: the HLS muxer writes ENDLIST on its way out even when FFmpeg
@@ -35,30 +35,46 @@ const activeJobs = new Map<string, HLSJob>();
  * that looks finished, and treating ENDLIST as "complete" makes the wreckage
  * permanent — it is re-served on every later request and survives restarts.
  *
- * A playlist is usable only if it also declares real media: a non-zero
- * TARGETDURATION and at least one segment with a non-zero duration. Copying
- * from a container that carries no packet timestamps (AVI) produces exactly
- * the opposite — `#EXT-X-TARGETDURATION:0` and `#EXTINF:0.000000` — which
- * hls.js reads as a complete playlist containing nothing, and stalls on
- * forever.
+ * The one thing that actually distinguishes wreckage from a stream is whether
+ * any segment declares real media. Copying from a container that carries no
+ * packet timestamps (AVI) produces `#EXTINF:0.000000` — which hls.js reads as
+ * a complete playlist containing nothing, and stalls on forever.
+ *
+ * TARGETDURATION is deliberately NOT part of this test. FFmpeg rounds it to
+ * the nearest integer, so every transcode shorter than 0.5 s is written as
+ * `#EXT-X-TARGETDURATION:0` with perfectly good segments beside it. Requiring
+ * a non-zero value here rejected those as broken; see normalizeTargetDuration.
  */
 function isUsablePlaylist(content: string): boolean {
   if (!content.includes('#EXT-X-ENDLIST')) {
     return false;
   }
-  let targetDuration = 0;
-  let hasRealSegment = false;
   for (const raw of content.split('\n')) {
     const line = raw.trim();
-    if (line.startsWith('#EXT-X-TARGETDURATION:')) {
-      targetDuration = parseFloat(line.substring('#EXT-X-TARGETDURATION:'.length)) || 0;
-    } else if (line.startsWith('#EXTINF:')) {
-      if (parseFloat(line.substring('#EXTINF:'.length)) > 0) {
-        hasRealSegment = true;
-      }
+    if (line.startsWith('#EXTINF:') &&
+        parseFloat(line.substring('#EXTINF:'.length)) > 0) {
+      return true;
     }
   }
-  return targetDuration > 0 && hasRealSegment;
+  return false;
+}
+
+/**
+ * `#EXT-X-TARGETDURATION:0` is out of spec — RFC 8216 §4.3.3.1 requires that
+ * no segment exceed it, and a 0.34 s segment does. FFmpeg emits it anyway for
+ * any output under half a second, because it rounds rather than ceils.
+ *
+ * hls.js clamps the value back to 1 and plays such a playlist regardless, so
+ * this is not what breaks playback. It is rewritten because nothing else in
+ * the chain — Safari's native HLS on the `canPlayType` path, a proxy, a future
+ * hls.js — is obliged to be that forgiving, and 1 is correct for every segment
+ * this can apply to.
+ *
+ * Only the literal 0 is touched. Any other value is FFmpeg's own rounding of a
+ * real segment length and must be left alone.
+ */
+function normalizeTargetDuration(content: string): string {
+  return content.replace(/#EXT-X-TARGETDURATION:0(?!\d)/, '#EXT-X-TARGETDURATION:1');
 }
 
 async function detectCodecs(
@@ -159,8 +175,40 @@ function spawnHLSJob(
       Logger.debug('[HLSMWs] FFmpeg started:', cmdLine);
     })
     .on('end', () => {
-      const job = activeJobs.get(cacheDir);
-      if (job) job.done = true;
+      // Exit 0 is not the same as "produced something playable". FFmpeg can
+      // finish cleanly on an input whose video stream it could not read and
+      // still write a playlist that declares no media; `.on('error')` never
+      // fires for that. `done` was set regardless, so the wreck was served —
+      // and then rejected on adoption at the next restart. The validation
+      // existed, just not on the path that creates the file.
+      void (async () => {
+        const job = activeJobs.get(cacheDir);
+        if (!job) {
+          return;
+        }
+        const playlistPath = path.join(cacheDir, 'playlist.m3u8');
+        try {
+          const content = await fsp.readFile(playlistPath, 'utf8');
+          if (!isUsablePlaylist(content)) {
+            // Routed through onError rather than failing here, so that a
+            // stream copy which ends this way still gets its re-encode
+            // fallback — the same second chance a crashing copy gets.
+            Logger.error('[HLSMWs] FFmpeg exited 0 with no playable output for '
+              + inputPath);
+            onError(new Error('no playable output'));
+            return;
+          }
+          const fixed = normalizeTargetDuration(content);
+          if (fixed !== content) {
+            await fsp.writeFile(playlistPath, fixed);
+          }
+          job.done = true;
+        } catch (e) {
+          Logger.error('[HLSMWs] could not validate the finished playlist for '
+            + inputPath + ':', e);
+          onError(e instanceof Error ? e : new Error(String(e)));
+        }
+      })();
     })
     .on('error', (err: Error) => {
       Logger.error('[HLSMWs] FFmpeg error for ' + inputPath + ':', err.message);
@@ -429,9 +477,19 @@ export class HLSMWs {
       // it sees no new segments. With res.send() there is no ETag, so every
       // re-poll gets a fresh 200 with the current playlist content.
       const content = await fsp.readFile(playlistPath, 'utf8');
+
+      // waitForNewContent returns the moment it sees ENDLIST, which can be
+      // before the `.on('end')` handler above has finished validating what
+      // FFmpeg wrote. Validate the bytes we are about to send rather than
+      // trusting a flag that may be one tick behind.
+      if (content.includes('#EXT-X-ENDLIST') && !isUsablePlaylist(content)) {
+        res.status(500).json({message: 'Video could not be transcoded'});
+        return;
+      }
+
       res.setHeader('Cache-Control', 'no-cache, no-store');
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-      res.send(content);
+      res.send(normalizeTargetDuration(content));
     } catch (err) {
       next(err);
     }

@@ -5,6 +5,7 @@ import * as crypto from 'crypto';
 import {HLSMWs} from '../../../../src/backend/middlewares/HLSMWs';
 import {Config} from '../../../../src/common/config/private/Config';
 import {ProjectPath} from '../../../../src/backend/ProjectPath';
+import {FFmpegFactory} from '../../../../src/backend/model/FFmpegFactory';
 import {TestHelper} from '../../../TestHelper';
 
 // Real video from test assets — ffprobe can actually read this
@@ -333,5 +334,157 @@ describe('HLSMWs', () => {
         'a complete-looking playlist declaring no media was adopted as a valid transcode')
         .to.be.false;
     });
+  });
+  // -------------------------------------------------------------------------
+  // A transcode that ENDS rather than fails
+  // -------------------------------------------------------------------------
+  describe('a transcode that ends without failing', () => {
+    const MEDIA = path.join(TMP, 'media');
+    const CACHE = path.join(TMP, 'cache');
+    let restoreFFmpeg: (() => void) | null = null;
+
+    afterEach(() => {
+      if (restoreFFmpeg) {
+        restoreFFmpeg();
+        restoreFFmpeg = null;
+      }
+    });
+
+    /**
+     * A real, healthy clip shorter than half a second.
+     *
+     * Generated rather than committed because it is four frames of test
+     * pattern, and because the number that matters — the duration — should be
+     * visible in the test that depends on it.
+     */
+    async function makeTinyVideo(name: string, seconds: number): Promise<string> {
+      await fs.promises.mkdir(MEDIA, {recursive: true});
+      const out = path.join(MEDIA, name);
+      const ffmpeg = FFmpegFactory.get();
+      await new Promise<void>((resolve, reject) => {
+        (ffmpeg() as any)
+          .input('testsrc=size=64x64:rate=25').inputFormat('lavfi')
+          .input('sine=frequency=440:sample_rate=48000').inputFormat('lavfi')
+          .duration(seconds)
+          .videoCodec('libx264')
+          .addOption('-preset', 'veryfast')
+          .addOption('-pix_fmt', 'yuv420p')
+          .audioCodec('aac')
+          .addOption('-shortest')
+          .on('end', () => resolve())
+          .on('error', reject)
+          .save(out);
+      });
+      return out;
+    }
+
+    /** Replace FFmpeg with one that writes `playlist` and exits successfully. */
+    function stubFFmpegWriting(playlist: string): void {
+      const real = FFmpegFactory.get;
+      restoreFFmpeg = () => { (FFmpegFactory as any).get = real; };
+      (FFmpegFactory as any).get = () => {
+        const factory: any = () => {
+          const handlers: Record<string, (...args: any[]) => void> = {};
+          const cmd: any = {};
+          for (const m of ['inputOptions', 'videoCodec', 'audioCodec', 'addOption']) {
+            cmd[m] = () => cmd;
+          }
+          cmd.kill = (): void => undefined;
+          cmd.on = (event: string, cb: (...args: any[]) => void) => {
+            handlers[event] = cb;
+            return cmd;
+          };
+          cmd.save = (out: string) => {
+            setTimeout(() => {
+              void fs.promises.writeFile(out, playlist)
+                .then(() => handlers['end'] && handlers['end']());
+            }, 10);
+            return cmd;
+          };
+          return cmd;
+        };
+        factory.ffprobe = (file: string, cb: any) => (real() as any).ffprobe(file, cb);
+        return factory;
+      };
+    }
+
+    it('should serve and cache a clip too short for FFmpeg to round up', async () => {
+      // FFmpeg ROUNDS #EXT-X-TARGETDURATION to the nearest integer, so every
+      // transcode under half a second is written as `:0` — the same shape a
+      // crashed stream copy leaves behind, from a completely healthy input.
+      // Rejecting it cost a re-transcode on every server start and served a
+      // playlist no spec-abiding player has to accept.
+      Config.Media.Video.liveVideoTranscodingEnabled = true;
+      const video = await makeTinyVideo('tiny.mp4', 0.3);
+      Config.Media.folder = MEDIA;
+      Config.Media.tempFolder = CACHE;
+      ProjectPath.reset();
+
+      const res = makeRes();
+      await HLSMWs.servePlaylist(
+        makeReq({mediaPath: path.basename(video)}) as any, res as any, () => {});
+
+      expect(res.statusCode, 'a sub-half-second clip was rejected').to.equal(200);
+      expect(res.body).to.be.a('string');
+      expect(res.body).to.contain('#EXT-X-TARGETDURATION:1');
+      expect(res.body).to.not.contain('#EXT-X-TARGETDURATION:0');
+
+      // Let the completion handler finish validating and rewriting on disk.
+      await new Promise(r => setTimeout(r, 500));
+
+      const res2 = makeRes();
+      await HLSMWs.servePlaylist(
+        makeReq({mediaPath: path.basename(video)}) as any, res2 as any, () => {});
+      expect(res2.statusCode, 'the completed transcode was not cached').to.equal(200);
+      const onDisk = await fs.promises.readFile(res2.body as string, 'utf8');
+      expect(onDisk).to.contain('#EXT-X-TARGETDURATION:1');
+    });
+
+    it('should NOT serve a fresh transcode that exited 0 with no playable media',
+      async () => {
+        // The asymmetry this closes: isUsablePlaylist() guarded the cached
+        // adoption path only. FFmpeg exiting 0 on an unreadable stream set
+        // done=true, so the first request served the wreck and every restart
+        // re-ran the transcode to produce it again.
+          Config.Media.Video.liveVideoTranscodingEnabled = true;
+        Config.Media.folder = ASSETS_DIR;
+        Config.Media.tempFolder = CACHE;
+        ProjectPath.reset();
+        stubFFmpegWriting([
+          '#EXTM3U',
+          '#EXT-X-VERSION:7',
+          '#EXT-X-TARGETDURATION:0',
+          '#EXT-X-MAP:URI="init.mp4"',
+          '#EXTINF:0.000000,',
+          'segment_000.m4s',
+          '#EXT-X-ENDLIST',
+          '',
+        ].join('\n'));
+
+        const res = makeRes();
+        await HLSMWs.servePlaylist(
+          makeReq({mediaPath: REAL_VIDEO}) as any, res as any, () => {});
+
+        expect(res.statusCode,
+          'a playlist declaring no media was served as a successful transcode')
+          .to.equal(500);
+
+        // Both the stream copy and its re-encode fallback end this way, so the
+        // cache must be gone once the second one has given up too.
+        await new Promise(r => setTimeout(r, 500));
+        const fullPath = path.join(ASSETS_DIR, REAL_VIDEO);
+        const stat = await fs.promises.stat(fullPath);
+        const cacheDir = path.join(ProjectPath.TempFolder, 'hls',
+          crypto.createHash('sha256')
+            .update(fullPath + stat.mtimeMs.toString()).digest('hex'));
+        let cacheKept = true;
+        try {
+          await fs.promises.access(path.join(cacheDir, 'playlist.m3u8'));
+        } catch {
+          cacheKept = false;
+        }
+        expect(cacheKept, 'the unusable transcode was left on disk to be adopted')
+          .to.be.false;
+      });
   });
 });

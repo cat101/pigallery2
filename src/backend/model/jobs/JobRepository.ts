@@ -10,6 +10,7 @@ import {AlbumRestJob} from './jobs/AlbumResetJob';
 import {GPXCompressionResetJob} from './jobs/GPXCompressionResetJob';
 import {TopPickSendJob} from './jobs/TopPickSendJob';
 import {AlbumCoverRestJob} from './jobs/AlbumCoverResetJob';
+import {DigikamTagAlbumsJob} from './jobs/DigikamTagAlbumsJob';
 
 export class JobRepository {
   private static instance: JobRepository = null;
@@ -49,3 +50,4 @@ JobRepository.Instance.register(new TempFolderCleaningJob());
 JobRepository.Instance.register(new AlbumRestJob());
 JobRepository.Instance.register(new GPXCompressionResetJob());
 JobRepository.Instance.register(new TopPickSendJob());
+JobRepository.Instance.register(new DigikamTagAlbumsJob());

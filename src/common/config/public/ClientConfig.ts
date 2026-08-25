@@ -274,6 +274,15 @@ export class ClientSearchConfig {
     description: $localize`Search also returns with metafiles from directories that contain a media file of the matched search result.`,
   })
   listMetafiles: boolean = true;
+  @ConfigProperty({
+    tags:
+      {
+        name: $localize`Diacritic-insensitive search`,
+        priority: ConfigPriority.advanced
+      },
+    description: $localize`Match accented characters as their base letters. With this on, 'position:(Cordoba)' also finds photos tagged 'Córdoba', and vice-versa. Same for 'keyword:'. SQLite-only — has no effect on MySQL deployments (use a *_ci collation there). German users may want to leave this off: it strips umlauts as 'ä → a' instead of the conventional 'ä → ae'.`,
+  })
+  DiacriticInsensitive: boolean = false;
 }
 
 @SubConfigClass({tags: {client: true}, softReadonly: true})

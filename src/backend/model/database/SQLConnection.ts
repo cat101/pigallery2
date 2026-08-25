@@ -202,7 +202,9 @@ export class SQLConnection {
     options: DataSourceOptions
   ): Promise<Connection> {
     if (options.type === 'sqlite' || options.type === 'better-sqlite3') {
-      return await createConnection(options);
+      const conn = await createConnection(options);
+      this.registerSqliteFunctions(conn);
+      return conn;
     }
     try {
       return await createConnection(options);
@@ -266,6 +268,29 @@ export class SQLConnection {
     }
   }
 
+
+  // Register pigallery2-specific SQL UDFs on the underlying better-sqlite3
+  // connection. Called from createConnection for every fresh sqlite connection
+  // (UDFs are per-connection in SQLite — they don't survive close()/reopen()).
+  //
+  // Currently registers:
+  //   - unaccent(text): NFKD-normalize, strip combining marks, lowercase.
+  //     Used by the diacritic-insensitive search toggle
+  //     (Config.Search.DiacriticInsensitive).
+  private static registerSqliteFunctions(connection: Connection): void {
+    const db = (connection.driver as any).databaseConnection;
+    if (!db || typeof db.function !== 'function') {
+      Logger.warn(LOG_TAG, 'sqlite driver does not expose .function(); UDFs not registered');
+      return;
+    }
+    try {
+      db.function('unaccent', (s: string) =>
+        s == null ? s : s.normalize('NFKD').replace(/\p{Diacritic}/gu, '').toLowerCase()
+      );
+    } catch (e) {
+      Logger.warn(LOG_TAG, `failed to register sqlite UDFs: ${e}`);
+    }
+  }
 
   private static getDriver(config: ServerDataBaseConfig): Writeable<DataSourceOptions> {
     let driver: Writeable<DataSourceOptions>;

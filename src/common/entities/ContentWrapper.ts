@@ -463,7 +463,8 @@ export class ContentWrapperUtils {
         delete (m as PhotoDTO).metadata.caption;
         delete (m as PhotoDTO).metadata.cameraData;
         delete (m as PhotoDTO).metadata.faces;
-        delete (m as PhotoDTO).metadata.positionData;
+        // positionData kept for videos: an XMP sidecar can carry GPS for an MP4
+        // exactly like it does for a JPEG, and the schema already supports it.
         ContentWrapperUtils.mapify(cw, m, isSearchResult);
       }
       Utils.removeNullOrEmptyObj(m);

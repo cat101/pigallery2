@@ -956,9 +956,30 @@ export class SearchManager {
       const whereFN = (query as TextSearch).negate ? 'andWhere' : 'orWhere';
       const whereFNRev = (query as TextSearch).negate ? 'orWhere' : 'andWhere';
 
+      // Diacritic-insensitive search via the `unaccent` SQLite UDF
+      // (registered in SQLConnection.registerSqliteFunctions). When the
+      // toggle is on AND the backend is SQLite, wrap both column and
+      // parameter so 'Cordoba' matches 'Córdoba'/'CORDOBA' and vice-versa.
+      // MySQL handles this via its own *_ci collation, no wrap needed.
+      const diacriticInsensitive = !!Config.Search?.DiacriticInsensitive
+        && Config.Database?.type === DatabaseType.sqlite;
+      const unaccentCol = (expr: string) =>
+        diacriticInsensitive ? `unaccent(${expr})` : expr;
+      const unaccentParam = (name: string) =>
+        diacriticInsensitive ? `unaccent(:${name})` : `:${name}`;
+
+      // Compose glob (always available, escape `\` when active) with optional
+      // diacritic folding. Both behaviors apply independently to every LIKE
+      // built below — e.g. `position:~Cord*` matches `Córdoba` under
+      // DiacriticInsensitive.
       const getLikeExpr = (fieldName: string, paramName: string): string => {
         const op = (query as TextSearch).negate ? 'NOT LIKE' : 'LIKE';
-        return `${fieldName} ${op} :${paramName}${queryId} COLLATE ${SQL_COLLATE}`;
+        // Post-#1133 every text search is converted to a glob (convertMatchTypeToGlob),
+        // so the LIKE pattern always carries escaped \% \_ and needs ESCAPE.
+        // unaccentCol/unaccentParam add the diacritic folding (location feature).
+        const col = unaccentCol(fieldName);
+        const par = unaccentParam(paramName + queryId);
+        return `${col} ${op} ${par} ESCAPE '\\' COLLATE ${SQL_COLLATE}`;
       };
 
       const textParam: { [key: string]: unknown } = {};
@@ -1039,9 +1060,44 @@ export class SearchManager {
           getLikeExpr('media.metadata.positionData.city', 'text'),
           textParam
         );
+        // Default-place search-time expansion: when DigikamPlacesTagEnabled
+        // is on and the search term equals any segment — or any consecutive
+        // run of segments — of the configured DefaultPlace, also return
+        // photos that have no location info at all (no country/state/city,
+        // no GPS). The default itself is never written into the DB — this
+        // is search-time expansion only. Only applied to positive matches;
+        // negation keeps the existing strict semantics (a `-position:(X)`
+        // query won't filter out unlocated rows).
+        //
+        // Equality on segment(s) — not substring — so `position:(a)` does
+        // NOT expand for a default of `Places/Argentina/Córdoba`, while
+        // `position:(Argentina)`, `position:(Córdoba)`, and
+        // `position:(Argentina/Córdoba)` all do.
+        //
+        // When DiacriticInsensitive is on, the comparison folds diacritics
+        // on both sides — otherwise typing 'Cordoba' wouldn't match a
+        // default like 'Places/Argentina/Córdoba'.
+        if (!(query as TextSearch).negate
+          && Config.Indexing.PhotoLocation?.DigikamPlacesTagEnabled
+          && Config.Indexing.PhotoLocation?.DefaultPlace) {
+          if (this.defaultPlaceMatchesValue(
+            Config.Indexing.PhotoLocation.DefaultPlace,
+            (query as TextSearch).value,
+            diacriticInsensitive)) {
+            q.orWhere(
+              '(media.metadata.positionData.country IS NULL'
+              + ' AND media.metadata.positionData.state IS NULL'
+              + ' AND media.metadata.positionData.city IS NULL'
+              + ' AND media.metadata.positionData.GPSData.latitude IS NULL'
+              + ' AND media.metadata.positionData.GPSData.longitude IS NULL)'
+            );
+          }
+        }
       }
 
-      // Matching for array type fields
+      // Matching for array type fields. getLikeExpr applies unaccent() and
+      // glob ESCAPE uniformly across the simple-LIKE path and the four-corner
+      // exact/glob match.
       const matchArrayField = (fieldName: string): void => {
         q[whereFN](
           new Brackets((qbr): void => {
@@ -1049,30 +1105,18 @@ export class SearchManager {
             qbr[whereFN](
               new Brackets((qb): void => {
                 const globPattern = convertGlobToLike((query as TextSearch).value);
-                const esc = ' ESCAPE \'\\\'';
-                const op = (query as TextSearch).negate ? 'NOT LIKE' : 'LIKE';
 
                 textParam['CtextC' + queryId] = `%,${globPattern},%`;
                 textParam['Ctext' + queryId] = `%,${globPattern}`;
                 textParam['textC' + queryId] = `${globPattern},%`;
                 textParam['text_exact' + queryId] = `${globPattern}`;
 
-                qb[whereFN](
-                  `${fieldName} ${op} :CtextC${queryId}${esc} COLLATE ${SQL_COLLATE}`,
-                  textParam
-                );
-                qb[whereFN](
-                  `${fieldName} ${op} :Ctext${queryId}${esc} COLLATE ${SQL_COLLATE}`,
-                  textParam
-                );
-                qb[whereFN](
-                  `${fieldName} ${op} :textC${queryId}${esc} COLLATE ${SQL_COLLATE}`,
-                  textParam
-                );
-                qb[whereFN](
-                  `${fieldName} ${op} :text_exact${queryId}${esc} COLLATE ${SQL_COLLATE}`,
-                  textParam
-                );
+                // Four-corner comma-boundary match for the simple-array column,
+                // via getLikeExpr so diacritic folding + ESCAPE apply uniformly.
+                qb[whereFN](getLikeExpr(fieldName, 'CtextC'), textParam);
+                qb[whereFN](getLikeExpr(fieldName, 'Ctext'), textParam);
+                qb[whereFN](getLikeExpr(fieldName, 'textC'), textParam);
+                qb[whereFN](getLikeExpr(fieldName, 'text_exact'), textParam);
               })
             );
             if ((query as TextSearch).negate) {
@@ -1097,6 +1141,35 @@ export class SearchManager {
       }
       return q;
     });
+  }
+
+  // Returns true when `value` equals any non-Places segment of `defaultPlace`,
+  // or any consecutive run of segments joined by '/'. Comparison is case-
+  // insensitive; when `foldDiacritics` is true it also folds diacritics on
+  // both sides. Used by the default-place search-time expansion above.
+  private defaultPlaceMatchesValue(
+    defaultPlace: string,
+    value: string | undefined,
+    foldDiacritics: boolean
+  ): boolean {
+    if (!value) return false;
+    const fold = (s: string) => foldDiacritics
+      ? s.normalize('NFKD').replace(/\p{Diacritic}/gu, '').toLowerCase()
+      : s.toLowerCase();
+    const v = fold(value);
+    if (!v) return false;
+    const segs = defaultPlace.split('/')
+      .filter(s => s.length > 0 && s !== 'Places')
+      .map(fold);
+    for (let i = 0; i < segs.length; i++) {
+      let joined = segs[i];
+      if (joined === v) return true;
+      for (let j = i + 1; j < segs.length; j++) {
+        joined += '/' + segs[j];
+        if (joined === v) return true;
+      }
+    }
+    return false;
   }
 
   public hasDirectoryQuery(query: SearchQueryDTO): boolean {

@@ -16,6 +16,25 @@ It supports **OpenStreetMap** and **Mapbox** by default, but you can also add yo
 The gallery also supports `.gpx` files to show your tracked path on the map. It recognizes different types of activities (e.g., running, flying) from the `.gpx` files and shows them with different colors and icons.
 ![Map](assets/map.png)
 
+#### Where the location data comes from
+Out of the box pigallery2 reads location from:
+
+- **GPS** recorded by the camera (EXIF GPS IFD or XMP).
+- **IPTC IIM** / **XMP-photoshop** city/state/country fields, typically set by editing software like digiKam.
+
+When a photo carries only some of those fields, the **Photo Location** section in *Admin → Indexing → Photo Location* can fill the gaps:
+
+- **Use Digikam Place tags** reads digiKam's `Places/Country/State/City` hierarchical tags, so a tag like `Places/United States/Oregon/Portland` becomes searchable as `position:(Portland)` even on a scan with no GPS or IPTC fields.
+- **Reverse geocoding** turns raw GPS coordinates into country/state/city using a 15 MB cities database that ships with pigallery2 — no internet calls.
+- **Add GPS coordinates** does the reverse: for photos that have a text location but no GPS, it picks a coordinate by walking from city to state to country, preferring an average of your own photos at the same place when there are enough of them, and falling back to the cities database otherwise. These synthesised pins look identical to real GPS pins on the map.
+
+A couple of extras live in the same admin section:
+
+- **Default place for unlocated photos** lets you point at a `Places/...` path so that searches like `position:(Cordoba)` also surface photos that have no location info at all. The default itself is never written into your photos.
+- **`places_overrides.json`**, a small file next to `config.json`, lets you pin a manual coordinate to a digiKam Places path for spots the cities database doesn't know (a family cabin, a specific neighbourhood). It only fills missing GPS — it never overwrites a real one.
+
+**Diacritic-insensitive search** (under *Admin → Search*) makes `position:(Cordoba)` also match `Córdoba`, and the other way around. SQLite-only.
+
 ### Advanced Searching
 Supports full boolean logic with negation and exact or wildcard search. It also provides handy suggestions with autocomplete.
 ![Advanced Searching](assets/search.png)
@@ -57,6 +76,9 @@ directory:"dir name/another dir"
 file_name:"img.jpg"
 person:"John"
 position:"USA" # use city, state, country names
+position:"Portland" # matches whatever pigallery2 has indexed (country, state or city)
+# enable Photo Location in admin to fill country/state/city from GPS or digiKam Places tags
+# (see the Map section above for details)
 5-km-from:(New York) # photos 5 km from the center of New York
 any_text:"apple" # searches for apple everywhere, "any_text:" can be omitted
 last-4-days:every-week
@@ -163,6 +185,9 @@ Build your own extensions. Mostly server-side changes are supported with minimal
     - Render photos on OpenStreetMap.
     - `.gpx` file support for rendering paths.
     - Support for any tile URL provider.
+    - Read location from digiKam `Places/Country/State/City` tags (opt-in).
+    - Offline reverse-geocode GPS → country/state/city using a bundled GeoNames cities database, no internet (opt-in).
+    - Synthesise GPS for text-only photos so they show on the map (opt-in; pins indistinguishable from camera-recorded GPS).
 - **Photo Frame**:
     - Automatically show and loop through photos of a given directory or search result. [#1060](https://github.com/bpatrik/pigallery2/issues/1060)
 - **Extensions**: Build your own extensions. See: [Extension Development](development/extensions.md)

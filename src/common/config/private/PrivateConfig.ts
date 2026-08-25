@@ -607,6 +607,78 @@ export class ServerSharingConfig extends ClientSharingConfig {
   updateTimeout: number = 1000 * 60 * 5;
 }
 
+// Registry key for the offline geocoder. Currently the only shipped provider
+// is the GeoNames cities1000 SQLite DB built by `cities-db/build-cities-db.js`.
+// Add additional registry keys here as new providers are implemented
+// (cities500, self-hosted Nominatim, etc).
+export const OFFLINE_CITIES1000_PROVIDER = 'offline-cities1000';
+
+@SubConfigClass({softReadonly: true})
+export class PhotoLocationConfig {
+  @ConfigProperty({
+    type: 'boolean',
+    tags: {
+      name: $localize`Use Digikam Place tags`,
+      priority: ConfigPriority.advanced,
+      uiResetNeeded: {db: true},
+    } as TAGS,
+    description: $localize`If you tag photos in digiKam with places like 'United States/Oregon/Portland', turn this on so pigallery2 reads those tags as the photo's location. After re-indexing, searching 'position:(Portland)' finds every photo tagged that way — including old scans with no GPS. Only enable this if your tags follow the 'Places/Country/...' layout; leave it off if your tag tree means something else.`,
+  })
+  DigikamPlacesTagEnabled: boolean = false;
+
+  @ConfigProperty({
+    type: 'string',
+    tags: {
+      // Name prefixed with the parent toggle's label so the admin UI's
+      // alphabetical-within-priority sort places this field directly under
+      // "Use Digikam Place tags".
+      name: $localize`Use Digikam Place tags — Default place for unlocated photos`,
+      priority: ConfigPriority.advanced,
+      relevant: (sub: PhotoLocationConfig) => sub.DigikamPlacesTagEnabled,
+    } as TAGS,
+    description: $localize`A Places-tree path (e.g., 'Places/Argentina/Cordoba') that pigallery2 treats as the default location for photos with no GPS, no IPTC location, and no Places tag at all. Nothing is written to disk or to the photo's data — but when you search 'position:(X)' and X matches any segment of this path, those unlocated photos also come up. Empty disables the behaviour. No map pins are added for these photos.`,
+  })
+  DefaultPlace: string = '';
+
+  @ConfigProperty({
+    type: 'boolean',
+    tags: {
+      name: $localize`Reverse geocoding`,
+      priority: ConfigPriority.advanced,
+      uiResetNeeded: {db: true},
+    } as TAGS,
+    description: $localize`Turns GPS coordinates into the country, state and city the photo was taken in — useful for phone and camera photos that record where but not what. Looks the answer up in a 15 MB cities database that ships with pigallery2; no internet needed.`,
+  })
+  ReverseGeocodeEnabled: boolean = false;
+
+  @ConfigProperty({
+    type: 'boolean',
+    tags: {
+      name: $localize`Add GPS coordinates`,
+      priority: ConfigPriority.advanced,
+      uiResetNeeded: {db: true},
+    } as TAGS,
+    description: $localize`Puts text-only photos on the map. For each photo that has a country/city but no GPS — scanned negatives, very old photos, anything tagged by hand — pigallery2 picks a sensible coordinate: first by averaging GPS from your other photos at the same place, then by the city's centre in the cities database. Caveat: these synthesised pins look identical to real GPS pins on the map.`,
+  })
+  SyntheticGPSEnabled: boolean = false;
+
+  @ConfigProperty({
+    type: 'unsignedInt',
+    tags: {
+      // Name prefixed with the parent toggle's label so the admin UI's
+      // alphabetical-within-priority sort places this field directly under
+      // "Add GPS coordinates". Promoted from underTheHood → advanced so it
+      // groups with its parent (the priority sort runs before alphabetical).
+      name: $localize`Add GPS coordinates — Minimum library samples for centroid`,
+      priority: ConfigPriority.advanced,
+      relevant: (sub: PhotoLocationConfig) => sub.SyntheticGPSEnabled,
+      uiResetNeeded: {db: true},
+    } as TAGS,
+    description: $localize`How many GPS-bearing photos must exist at a (country, state, city) — or partial — group before its averaged centroid is preferred over the offline cities database. Defaults to 3; lower values are more aggressive but vulnerable to a single mis-located photo dragging every sibling-tagged photo to the wrong spot. Set to 1 to restore the original library-first-always behaviour.`,
+  })
+  SyntheticGPSMinLibSamples: number = 3;
+}
+
 @SubConfigClass({softReadonly: true})
 export class ServerIndexingConfig {
   @ConfigProperty({
@@ -669,6 +741,18 @@ export class ServerIndexingConfig {
     description: $localize`Glob patterns to exclude individual media files from indexing. Supports '*' (any characters), '?' (single character) wildcards and ';' to separate multiple patterns. E.g.: '._*' excludes macOS resource fork files starting with '._'; '*.rm' excludes .rm files.`,
   })
   excludeFilenameList: string[] = [];
+
+  @ConfigProperty({
+    type: PhotoLocationConfig,
+    tags: {
+      name: $localize`Photo Location`,
+      priority: ConfigPriority.advanced,
+      uiResetNeeded: {db: true},
+    } as TAGS,
+    // No description — keeps the section heading without the highlighted
+    // info/alert box that typeconfig renders for SubConfigClass descriptions.
+  })
+  PhotoLocation: PhotoLocationConfig = new PhotoLocationConfig();
 }
 
 @SubConfigClass({softReadonly: true})

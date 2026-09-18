@@ -30,6 +30,10 @@ export class TestHelper {
 
   public static readonly TMP_DIR = path.join(__dirname, './tmp');
 
+  // parent===null does not give you an independent tree: path is always derived from
+  // the true root below, regardless of `name`. Media persisted under a directory built
+  // this way lands in whatever root the DB already has, not a new one. For a second,
+  // non-colliding directory, pass an already-persisted directory as `parent` instead.
   public static getDirectoryEntry(parent: DirectoryBaseDTO = null, name = '.'): DirectoryEntity {
 
     const dir = new DirectoryEntity();

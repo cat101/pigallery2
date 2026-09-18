@@ -3,6 +3,7 @@ import * as path from 'path';
 import {ProjectPath} from '../../ProjectPath';
 import {Config} from '../../../common/config/private/Config';
 import {JobProgressDTO, JobProgressStates,} from '../../../common/entities/job/JobProgressDTO';
+import {NotificationManager} from '../NotifocationManager';
 
 export class JobProgressManager {
   private static readonly VERSION = 3;
@@ -76,6 +77,16 @@ export class JobProgressManager {
           this.db.progresses[key].progress.state === JobProgressStates.cancelling
       ) {
         this.db.progresses[key].progress.state = JobProgressStates.interrupted;
+        // A job that was still running at the last shutdown was killed mid-flight
+        // (server restart, container OOM, crash) — its results are likely
+        // incomplete even though nothing logged a failure. A hard crash can't
+        // report itself, so this startup reconciliation is the only place to
+        // surface it: raise an admin notification prompting a re-run.
+        NotificationManager.warning(
+          'Job interrupted: ' + this.db.progresses[key].progress.jobName,
+          'The job was still running when the server last stopped (restart or crash) ' +
+          'and may be incomplete. Consider re-running it.'
+        );
       }
     }
   }

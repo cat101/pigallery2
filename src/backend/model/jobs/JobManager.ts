@@ -90,6 +90,17 @@ export class JobManager implements IJobListener, IObjectManager {
     state: JobProgressStates,
     soloRun: boolean
   ): Promise<void> => {
+    // A failed job otherwise raises no alert — it is only discoverable by
+    // opening Settings -> Jobs and noticing its state. Push it to the admin
+    // notification channel so a failure is visible without hunting through the
+    // job list. (Hard crashes like an OOM never reach here; those are surfaced
+    // on next startup by JobProgressManager.)
+    if (state === JobProgressStates.failed) {
+      NotificationManager.error(
+        'Job failed: ' + job.Name,
+        'The job did not finish successfully. See Settings -> Jobs for the logs.'
+      );
+    }
     // if it was not finished peacefully or was a soloRun, do not start the next one
     if (state !== JobProgressStates.finished || soloRun === true) {
       return;

@@ -11,7 +11,8 @@ export enum DefaultsJobs {
   'GPX Compression' = 9,
   'Album Reset' = 10,
   'Delete Compressed GPX' = 11,
-  'Top Pick Sending' = 12
+  'Top Pick Sending' = 12,
+  'Digikam Tag Albums' = 13
 }
 
 

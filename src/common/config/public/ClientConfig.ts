@@ -297,6 +297,31 @@ export class ClientSearchConfig {
 }
 
 @SubConfigClass({tags: {client: true}, softReadonly: true})
+export class ClientDigikamTagAlbumsConfig {
+  @ConfigProperty({
+    tags: {
+      name: $localize`Use digiKam tag tree as albums`,
+      priority: ConfigPriority.advanced,
+      uiResetNeeded: {db: true},
+    },
+    description: $localize`If you organise photos in digiKam under hierarchical tags like 'Albums/Trips/Cuba', turn this on to expose each such tag as a saved-search album. After re-indexing, run the 'Digikam Tag Albums' job to (re)generate the albums. Only tags under the prefixes below are used; the rest of your tag tree is untouched.`,
+  })
+  enabled: boolean = false;
+
+  @ConfigProperty({
+    type: 'string',
+    tags: {
+      name: $localize`Tag prefixes`,
+      priority: ConfigPriority.advanced,
+      uiResetNeeded: {db: true},
+      relevant: (sub: ClientDigikamTagAlbumsConfig) => sub.enabled,
+    },
+    description: $localize`Semicolon-separated list of digiKam tag-tree roots to turn into albums, e.g. 'Albums/;About/'. A tag 'Albums/Trips/Cuba' becomes an album named 'Trips/Cuba'.`,
+  })
+  tagPrefixes: string = '';
+}
+
+@SubConfigClass({tags: {client: true}, softReadonly: true})
 export class ClientAlbumConfig {
   @ConfigProperty({
     tags:
@@ -316,6 +341,14 @@ export class ClientAlbumConfig {
     description: $localize`Required minimum right to show the albums tab.`
   })
   readAccessMinRole: UserRoles = UserRoles.User;
+
+  @ConfigProperty({
+    tags: {
+      name: $localize`digiKam tag-tree albums`,
+      priority: ConfigPriority.advanced,
+    },
+  })
+  digikamTagTree: ClientDigikamTagAlbumsConfig = new ClientDigikamTagAlbumsConfig();
 }
 
 @SubConfigClass({tags: {client: true}, softReadonly: true})

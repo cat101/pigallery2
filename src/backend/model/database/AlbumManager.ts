@@ -1,7 +1,12 @@
 import {SQLConnection} from './SQLConnection';
 import {AlbumBaseEntity} from './enitites/album/AlbumBaseEntity';
 import {ObjectManagers} from '../ObjectManagers';
-import {SearchQueryDTO} from '../../../common/entities/SearchQueryDTO';
+import {
+  SearchQueryDTO,
+  SearchQueryTypes,
+  TextSearch,
+  TextSearchQueryMatchTypes,
+} from '../../../common/entities/SearchQueryDTO';
 import {SavedSearchEntity} from './enitites/album/SavedSearchEntity';
 import {Logger} from '../../Logger';
 import {SessionContext} from '../SessionContext';
@@ -13,6 +18,66 @@ import {Job} from '../jobs/jobs/Job';
 const LOG_TAG = '[AlbumManager]';
 
 export class AlbumManager extends ProjectionAwareManager<AlbumBaseEntity> {
+
+  // --- digiKam tag-tree albums (see DigikamTagAlbumsJob / IndexingManager) ---
+  // The single source of truth for how a tag path maps to an album, so that
+  // incremental creation (indexing), bulk creation and pruning (the job) all
+  // agree on the album's name and query shape.
+
+  // Leading segment of a path, e.g. "Albums/Trips/Cuba" -> "Albums".
+  public static digikamTagRoot(path: string): string {
+    return path.split('/', 1)[0];
+  }
+
+  // Display name = path with the prefix root stripped: "Trips/Cuba".
+  public static digikamTagAlbumName(path: string): string {
+    return path.substring(path.indexOf('/') + 1);
+  }
+
+  // Exact keyword match on the full prefixed path.
+  public static digikamTagAlbumQuery(path: string): TextSearch {
+    return {
+      type: SearchQueryTypes.keyword,
+      matchType: TextSearchQueryMatchTypes.exact_match,
+      value: path,
+    };
+  }
+
+  // True if an album looks like one we generated from a tag under `prefixes`:
+  // an exact keyword query whose value sits under a prefix and whose name is
+  // the stripped suffix. Used by the job to prune only its own albums.
+  public static isDigikamTagAlbum(a: SavedSearchEntity, prefixes: string[]): boolean {
+    const q = a.searchQuery as TextSearch;
+    return q?.type === SearchQueryTypes.keyword
+      && q.matchType === TextSearchQueryMatchTypes.exact_match
+      && typeof q.value === 'string'
+      && prefixes.indexOf(AlbumManager.digikamTagRoot(q.value)) !== -1
+      && a.name === AlbumManager.digikamTagAlbumName(q.value);
+  }
+
+  public async addDigikamTagAlbum(fullPath: string): Promise<void> {
+    await this.addIfNotExistSavedSearch(
+      AlbumManager.digikamTagAlbumName(fullPath),
+      AlbumManager.digikamTagAlbumQuery(fullPath),
+      false
+    );
+  }
+
+  // Delete all generated tag-tree albums. Called on Gallery Reset so they don't
+  // linger as orphans pointing at a wiped index — they regenerate on re-index.
+  // Manual saved searches (any album that isn't shaped like a tag album) are
+  // left intact.
+  public async deleteDigikamTagAlbums(prefixes: string[]): Promise<void> {
+    if (prefixes.length === 0) {
+      return;
+    }
+    const connection = await SQLConnection.getConnection();
+    for (const a of await connection.getRepository(SavedSearchEntity).find()) {
+      if (AlbumManager.isDigikamTagAlbum(a, prefixes)) {
+        await this.deleteAlbum(a.id);
+      }
+    }
+  }
 
   public async addIfNotExistSavedSearch(
     name: string,

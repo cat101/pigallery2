@@ -45,6 +45,14 @@ export class IndexingJob<
       if (ObjectManagers.getInstance().IndexingManager.IsSavingInProgress) {
         await ObjectManagers.getInstance().IndexingManager.SavingReady;
       }
+      try {
+        const r = await ObjectManagers.getInstance().IndexingManager.synthesizeGPS();
+        if (r.scanned > 0) {
+          this.Progress.log(`Synthesized GPS for ${r.updated}/${r.scanned} photos`);
+        }
+      } catch (e) {
+        this.Progress.log('synthesizeGPS failed: ' + e);
+      }
       this.Progress.Left = 0;
       return false;
     }

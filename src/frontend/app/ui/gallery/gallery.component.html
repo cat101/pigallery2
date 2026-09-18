@@ -39,6 +39,16 @@
         Too many results to show. Refine your search.
       </div>
 
+      <!-- Photo Location: backend is still synthesizing GPS / running the
+           save pipeline; the frontend is polling and will re-render
+           automatically once it completes. -->
+      <div class="alert alert-info py-2 d-flex align-items-center"
+           role="alert"
+           *ngIf="ContentWrapper.directory?.syncing">
+        <div class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></div>
+        <span i18n>Adding location data for this folder — the map will update automatically when it is done.</span>
+      </div>
+
 
       <app-gallery-directories class="directories"
                                [directories]="directoryContent?.directories || []"></app-gallery-directories>

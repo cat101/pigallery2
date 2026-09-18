@@ -48,6 +48,7 @@ export interface PositionMetaData {
 export interface GPSMetadata {
   latitude?: number; // float with precision: 6
   longitude?: number; // float with precision: 6
+  synthesized?: boolean; // derived from the text location, not read from the file
 }
 
 export interface CameraMetadata {

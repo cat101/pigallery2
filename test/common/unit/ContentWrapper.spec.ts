@@ -66,6 +66,37 @@ describe('ContentWrapper', () => {
   });
 
 
+  it('pack and unpack a video with positionData (GPS + country/state/city)', () => {
+    // Regression for the upstream "packMedia deletes video.positionData" bug
+    // — videos carrying location data from an XMP sidecar must survive the
+    // pack/unpack roundtrip.
+    const parent: DirectoryPathDTO = {name: 'parent', path: ''};
+    const video = TestHelper.getVideoEntry(parent as any);
+    (video.metadata as any).positionData = {
+      country: 'Argentina',
+      state: 'Cordoba',
+      city: 'Córdoba',
+      GPSData: {latitude: -31.432, longitude: -64.1729},
+    };
+    const sr: SearchResultDTO = {
+      directories: [],
+      media: [video as any],
+      metaFile: [],
+      resultOverflow: false,
+      searchQuery: {type: SearchQueryTypes.any_text, value: ''} as TextSearch
+    };
+    const cw = ContentWrapperUtils.build(null, sr);
+    const roundtripped = ContentWrapperUtils.unpack(
+      ContentWrapperUtils.pack(Utils.clone(cw))
+    );
+    const m = roundtripped.searchResult.media[0] as any;
+    expect(m.metadata.positionData.country).to.equal('Argentina');
+    expect(m.metadata.positionData.state).to.equal('Cordoba');
+    expect(m.metadata.positionData.city).to.equal('Córdoba');
+    expect(m.metadata.positionData.GPSData.latitude).to.equal(-31.432);
+    expect(m.metadata.positionData.GPSData.longitude).to.equal(-64.1729);
+  });
+
   it('pack and unpack search result', () => {
 
     const parent: DirectoryPathDTO = {

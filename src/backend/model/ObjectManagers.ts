@@ -18,6 +18,9 @@ import {ExtensionManager} from './extension/ExtensionManager';
 import {ProjectedCacheManager} from './database/ProjectedCacheManager';
 import {SessionManager} from './database/SessionManager';
 import { UploadManager } from './UploadManager';
+import {GeocodeProviderRegistry, OfflineCitiesGeocodeProvider} from './database/OfflineGeocodeProvider';
+import {ProjectPath} from '../ProjectPath';
+import * as path from 'path';
 
 const LOG_TAG = '[ObjectManagers]';
 
@@ -94,6 +97,10 @@ export class ObjectManagers {
   }
 
   private async initManagers(): Promise<void> {
+    GeocodeProviderRegistry.register(
+      'offline-cities1000',
+      () => new OfflineCitiesGeocodeProvider(path.join(ProjectPath.Root, 'cities-db', 'cities1000.sqlite'))
+    );
     this.AlbumManager = new AlbumManager();
     this.GalleryManager = new GalleryManager();
     this.IndexingManager = new IndexingManager();

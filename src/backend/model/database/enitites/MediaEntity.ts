@@ -52,6 +52,24 @@ export class GPSMetadataEntity implements GPSMetadata {
   latitude: number;
   @Column('float', {nullable: true})
   longitude: number;
+
+  /**
+   * True when these coordinates were derived by IndexingManager.synthesizeGPS()
+   * from the photo's text location, rather than read from the file.
+   *
+   * Load-bearing, not informational. synthesizeGPS builds its centroid index
+   * from "rows that have coordinates", and without this flag its own output
+   * feeds back in as evidence: one photo centroided to a country's midpoint
+   * became a GPS sample for the city triple it was tagged with, and dragged
+   * four accurate anchors 17 km. It also lets the end-of-index pass revisit
+   * rows it wrote earlier from partial information, which is what makes the
+   * result independent of the order directories were saved in.
+   *
+   * NULL for real GPS, so it costs nothing on the wire (removeNullOrEmptyObj
+   * strips it) and nothing in a row that never went through synthesis.
+   */
+  @Column('boolean', {nullable: true})
+  synthesized: boolean;
 }
 
 export class PositionMetaDataEntity implements PositionMetaData {

@@ -19,6 +19,13 @@ import {FileEntity} from './enitites/FileEntity';
 
 const LOG_TAG = '[GalleryManager]';
 
+// Lazy-reindex deadline: time the scan+save pipeline is given before the
+// response falls back to a syncing=true stub and the frontend starts polling.
+// 25 s sits well under typical reverse-proxy timeouts (≥30 s) and
+// accommodates most folders on healthy storage. Folders that take longer
+// (hundreds of photos on slow NFS) get the stub-then-poll experience.
+const LAZY_INDEX_DEADLINE_MS = 25_000;
+
 export class GalleryManager {
   public static parseRelativeDirPath(relativeDirectoryName: string): {
     name: string;
@@ -119,7 +126,17 @@ export class GalleryManager {
       const dir = await this.getDirIdAndTime(connection, directoryPath.name, directoryPath.parent);
       return await this.getParentDirFromId(connection, session, dir.id);
     }
-    return ObjectManagers.getInstance().IndexingManager.indexDirectory(relativeDirectoryName);
+    // Race the whole scan+save chain against a deadline. Small folders
+    // finish in time and the response carries the full content (with any
+    // synthesised GPS from the post-save GPS-from-text pass) on the first
+    // call. Big folders blow the deadline and the response is a
+    // `syncing = true` stub; the scan/save keep running in the background
+    // and the frontend polls every few seconds until the dir's cached path
+    // here picks up the freshly-saved content and serves real photos +
+    // map pins, without the user pressing refresh.
+    return ObjectManagers.getInstance().IndexingManager.indexDirectory(
+      relativeDirectoryName, false, LAZY_INDEX_DEADLINE_MS
+    );
   }
 
   async countDirectories(): Promise<number> {

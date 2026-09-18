@@ -11,6 +11,12 @@
     "experimentalDecorators": true,
     "moduleResolution": "node",
     "importHelpers": true,
+    /* Third-party .d.ts files are not ours to fix, and two of them do not
+       type-check against each other in the current lock: @types/glob-stream
+       8.0.3 vs @types/streamx 2.9.5 (TS2344 on ReadableEvents). Without this,
+       the dev container entrypoint's `set -e; npx tsc` exits non-zero and the
+       container crash-loops. */
+    "skipLibCheck": true,
     "target": "ES2022",
     "module": "CommonJS",
     "useDefineForClassFields": false,
